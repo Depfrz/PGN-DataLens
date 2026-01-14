@@ -3,13 +3,16 @@ from __future__ import annotations
 import os
 import logging
 import hashlib
+import csv
+import io
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 
@@ -35,16 +38,29 @@ from .schemas import (
 from .services.extraction import (
     build_extracted_json,
     extract_pdf_text,
+    extract_mto_from_pdf_bytes_advanced,
+    extract_mto_from_image_bytes_advanced,
+    convert_image_bytes_to_pdf,
+    detect_upload_kind,
     ocr_pdf_text,
     parse_doc_info,
     parse_materials,
     parse_materials_from_pdf_bytes,
+    validate_and_convert_image_upload,
 )
 
 
 app = FastAPI(title="PGN DataLens", version="0.1.0")
 security = HTTPBearer(auto_error=False)
 logger = logging.getLogger("pgn_datalens")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 FRONTEND_DIR = (Path(__file__).parent.parent / "frontend").resolve()
@@ -422,8 +438,6 @@ def list_documents(project_id: str, user_id: str = Depends(_require_auth)):
 @app.post("/api/projects/{project_id}/documents", response_model=Document)
 async def upload_document(project_id: str, file: UploadFile = File(...), user_id: str = Depends(_require_auth)):
     filename_in = file.filename or ""
-    if not filename_in.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Hanya PDF yang didukung")
 
     svc = get_supabase_service()
     pr = svc.table("projects").select("id").eq("id", project_id).eq("owner_id", user_id).maybe_single().execute()
@@ -432,11 +446,52 @@ async def upload_document(project_id: str, file: UploadFile = File(...), user_id
     if not pr.data:
         raise HTTPException(status_code=404, detail="Proyek tidak ditemukan")
 
-    content = await file.read()
+    try:
+        content = await file.read()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Gagal membaca file")
+
+    content_type_in = (file.content_type or "").lower() or None
+
+    try:
+        kind = detect_upload_kind(content, filename=filename_in, content_type=content_type_in)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     doc_id = str(uuid4())
-    filename = os.path.basename(filename_in) if filename_in else f"{doc_id}.pdf"
-    storage_path = f"{user_id}/{project_id}/{doc_id}/{filename}"
+    original_filename = os.path.basename(filename_in) if filename_in else None
     now = datetime.utcnow().isoformat()
+
+    mime_type = "application/pdf"
+    file_kind = "pdf"
+    image_w: int | None = None
+    image_h: int | None = None
+    file_size_bytes: int | None = None
+
+    if kind == "image":
+        try:
+            png_bytes, w, h, out_mime = validate_and_convert_image_upload(
+                content,
+                filename=original_filename or "upload.png",
+                content_type=content_type_in,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        content = png_bytes
+        mime_type = out_mime
+        file_kind = "image"
+        image_w = w
+        image_h = h
+        file_size_bytes = len(content)
+        filename = f"{doc_id}.png"
+        storage_path = f"{user_id}/{project_id}/images/{filename}"
+    else:
+        pdf_name = os.path.basename(filename_in) if filename_in else f"{doc_id}.pdf"
+        if not pdf_name.lower().endswith(".pdf"):
+            pdf_name = f"{pdf_name}.pdf"
+        filename = pdf_name
+        storage_path = f"{user_id}/{project_id}/{doc_id}/{filename}"
+        file_size_bytes = len(content)
+
     row = {
         "id": doc_id,
         "project_id": project_id,
@@ -448,12 +503,18 @@ async def upload_document(project_id: str, file: UploadFile = File(...), user_id
         "document_date": None,
         "status": "uploaded",
         "uploaded_at": now,
+        "file_kind": file_kind,
+        "mime_type": mime_type,
+        "file_size_bytes": file_size_bytes,
+        "image_width": image_w,
+        "image_height": image_h,
+        "original_filename": original_filename,
     }
 
     _ensure_storage_bucket(svc)
     storage = svc.storage.from_(settings.supabase_bucket)
     try:
-        storage.upload(storage_path, content, cast(Any, _storage_file_options("application/pdf")))
+        storage.upload(storage_path, content, cast(Any, _storage_file_options(mime_type)))
     except Exception as e:
         msg = str(e)
         if "bucket not found" in msg.lower():
@@ -667,6 +728,25 @@ async def extract_document(document_id: str, user_id: str = Depends(_require_aut
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
 
     d = doc.data
+
+    inferred_kind = (str(d.get("file_kind") or "").strip().lower() or None)
+    if inferred_kind is None:
+        sp = str(d.get("storage_path") or "")
+        fn = str(d.get("filename") or "")
+        if "/images/" in sp.replace("\\", "/") or fn.lower().endswith((".png", ".jpg", ".jpeg")):
+            inferred_kind = "image"
+        else:
+            inferred_kind = "pdf"
+
+    if inferred_kind != "pdf":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Dokumen ini berupa gambar. Ekstraksi hanya tersedia untuk PDF. "
+                "Langkah yang bisa dilakukan: (1) jalankan OCR MTO untuk gambar via /api/documents/{id}/mto, "
+                "atau (2) konversi gambar ke PDF via /api/documents/{id}/convert-to-pdf."
+            ),
+        )
     _ensure_storage_bucket(svc)
     storage = svc.storage.from_(settings.supabase_bucket)
     try:
@@ -685,6 +765,20 @@ async def extract_document(document_id: str, user_id: str = Depends(_require_aut
         file_bytes = r.content
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Gagal download file untuk ekstraksi: {e}")
+
+    try:
+        kind = detect_upload_kind(file_bytes, filename=str(d.get("filename") or ""), content_type=str(d.get("mime_type") or "") or None)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if kind != "pdf":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Konten file yang tersimpan bukan PDF. Ekstraksi hanya tersedia untuk PDF. "
+                "Langkah yang bisa dilakukan: (1) jalankan OCR MTO untuk gambar via /api/documents/{id}/mto, "
+                "atau (2) konversi gambar ke PDF via /api/documents/{id}/convert-to-pdf."
+            ),
+        )
 
     svc.table("documents").update({"status": "extracting"}).eq("id", document_id).eq("owner_id", user_id).execute()
 
@@ -773,6 +867,383 @@ async def extract_document(document_id: str, user_id: str = Depends(_require_aut
         raise HTTPException(status_code=500, detail="Gagal mengambil hasil ekstraksi")
     run = run_res.data
     return {"run": run, "inserted_materials": inserted}
+
+
+def _parse_bbox(bbox: str | None) -> tuple[float, float, float, float] | None:
+    if not bbox:
+        return None
+    parts = [p.strip() for p in bbox.split(",")]
+    if len(parts) != 4:
+        raise HTTPException(status_code=400, detail="bbox harus format: x0,y0,x1,y1")
+    try:
+        x0, y0, x1, y1 = (float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]))
+    except Exception:
+        raise HTTPException(status_code=400, detail="bbox harus angka: x0,y0,x1,y1")
+    return (x0, y0, x1, y1)
+
+
+async def _download_document_bytes(svc, storage_path: str) -> bytes:
+    _ensure_storage_bucket(svc)
+    storage = svc.storage.from_(settings.supabase_bucket)
+    try:
+        signed = storage.create_signed_url(storage_path, 300)
+        url = signed.get("signedURL")
+        if not url:
+            raise Exception("signed url kosong")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Tidak bisa akses file di storage: {e}")
+
+    import httpx
+
+    try:
+        r = httpx.get(url, timeout=60.0)
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Gagal download file: {e}")
+
+
+def _upload_output_bytes(
+    svc,
+    *,
+    user_id: str,
+    project_id: str,
+    document_id: str,
+    filename: str,
+    content: bytes,
+    content_type: str,
+) -> dict[str, Any]:
+    _ensure_storage_bucket(svc)
+    storage = svc.storage.from_(settings.supabase_bucket)
+    storage_path = f"{user_id}/{project_id}/outputs/{document_id}/{filename}"
+    try:
+        storage.upload(storage_path, content, cast(Any, _storage_file_options(content_type)))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Upload output gagal: {e}")
+
+    download_url = None
+    try:
+        signed = storage.create_signed_url(storage_path, settings.signed_url_expires_seconds)
+        download_url = signed.get("signedURL")
+    except Exception:
+        download_url = None
+
+    return {"storage_path": storage_path, "download_url": download_url, "content_type": content_type, "bytes": len(content)}
+
+
+def _require_doc_owner(svc, document_id: str, user_id: str) -> dict[str, Any]:
+    doc = svc.table("documents").select("*").eq("id", document_id).eq("owner_id", user_id).maybe_single().execute()
+    if doc is None:
+        raise HTTPException(status_code=500, detail="Gagal mengambil dokumen")
+    if not doc.data:
+        raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
+    return doc.data
+
+
+@app.post("/api/documents/{document_id}/mto")
+async def extract_mto_from_document(
+    document_id: str,
+    page_index: int = 0,
+    bbox: str | None = None,
+    split_columns: bool | None = None,
+    user_id: str = Depends(_require_auth),
+):
+    svc = get_supabase_service()
+    d = _require_doc_owner(svc, document_id, user_id)
+    file_kind = (str(d.get("file_kind") or "").strip().lower() or "pdf")
+    storage_path = str(d.get("storage_path") or "")
+    if not storage_path:
+        raise HTTPException(status_code=400, detail="storage_path kosong")
+
+    raw = await _download_document_bytes(svc, storage_path)
+
+    logger.info("mto_extract: doc=%s kind=%s", document_id, file_kind)
+
+    try:
+        kind = detect_upload_kind(raw, filename=str(d.get("filename") or ""), content_type=str(d.get("mime_type") or "") or None)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if file_kind == "image" or kind == "image":
+        try:
+            rows = extract_mto_from_image_bytes_advanced(raw, bbox=_parse_bbox(bbox), split_columns=split_columns)
+        except Exception as e:
+            msg = str(e)
+            if "Tesseract OCR tidak terdeteksi" in msg or "pytesseract tidak tersedia" in msg:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "OCR belum tersedia di server. Install Tesseract OCR di Windows dan pastikan tesseract.exe ada di PATH, "
+                        "atau set env TESSERACT_CMD. Setelah itu ulangi OCR MTO. Jika perlu, gunakan opsi konversi gambar ke PDF."
+                    ),
+                )
+            raise HTTPException(status_code=400, detail=f"OCR MTO gagal: {e}")
+
+        proj_id = str(d.get("project_id") or "")
+        txt_lines = ["item\tmaterial\tdescription\tnps\tqty_value\tqty_unit\tsource"]
+        for r in rows:
+            txt_lines.append(
+                "\t".join(
+                    [
+                        str(r.get("item") or ""),
+                        str(r.get("material") or ""),
+                        str(r.get("description") or ""),
+                        str(r.get("nps") or ""),
+                        str(r.get("qty_value") or ""),
+                        str(r.get("qty_unit") or ""),
+                        str(r.get("source") or ""),
+                    ]
+                )
+            )
+        txt_bytes = ("\n".join(txt_lines) + "\n").encode("utf-8")
+
+        csv_buf = io.StringIO()
+        w = csv.DictWriter(
+            csv_buf,
+            fieldnames=["item", "material", "description", "nps", "qty_value", "qty_unit", "source"],
+            extrasaction="ignore",
+        )
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+        csv_bytes = csv_buf.getvalue().encode("utf-8")
+
+        out_txt = _upload_output_bytes(
+            svc,
+            user_id=user_id,
+            project_id=proj_id,
+            document_id=document_id,
+            filename=f"mto_page{int(page_index)}.txt",
+            content=txt_bytes,
+            content_type="text/plain; charset=utf-8",
+        )
+        out_csv = _upload_output_bytes(
+            svc,
+            user_id=user_id,
+            project_id=proj_id,
+            document_id=document_id,
+            filename=f"mto_page{int(page_index)}.csv",
+            content=csv_bytes,
+            content_type="text/csv; charset=utf-8",
+        )
+
+        return {"items": rows, "outputs": {"txt": out_txt, "csv": out_csv}}
+
+    try:
+        rows = extract_mto_from_pdf_bytes_advanced(raw, int(page_index), bbox=_parse_bbox(bbox), split_columns=split_columns)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"OCR MTO gagal: {e}")
+
+    proj_id = str(d.get("project_id") or "")
+    txt_lines = ["item\tmaterial\tdescription\tnps\tqty_value\tqty_unit\tsource"]
+    for r in rows:
+        txt_lines.append(
+            "\t".join(
+                [
+                    str(r.get("item") or ""),
+                    str(r.get("material") or ""),
+                    str(r.get("description") or ""),
+                    str(r.get("nps") or ""),
+                    str(r.get("qty_value") or ""),
+                    str(r.get("qty_unit") or ""),
+                    str(r.get("source") or ""),
+                ]
+            )
+        )
+    txt_bytes = ("\n".join(txt_lines) + "\n").encode("utf-8")
+
+    csv_buf = io.StringIO()
+    w = csv.DictWriter(
+        csv_buf,
+        fieldnames=["item", "material", "description", "nps", "qty_value", "qty_unit", "source"],
+        extrasaction="ignore",
+    )
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+    csv_bytes = csv_buf.getvalue().encode("utf-8")
+
+    out_txt = _upload_output_bytes(
+        svc,
+        user_id=user_id,
+        project_id=proj_id,
+        document_id=document_id,
+        filename=f"mto_page{int(page_index)}.txt",
+        content=txt_bytes,
+        content_type="text/plain; charset=utf-8",
+    )
+    out_csv = _upload_output_bytes(
+        svc,
+        user_id=user_id,
+        project_id=proj_id,
+        document_id=document_id,
+        filename=f"mto_page{int(page_index)}.csv",
+        content=csv_bytes,
+        content_type="text/csv; charset=utf-8",
+    )
+
+    return {"items": rows, "outputs": {"txt": out_txt, "csv": out_csv}}
+
+
+@app.post("/api/documents/{document_id}/mto/csv")
+async def extract_mto_from_document_csv(
+    document_id: str,
+    page_index: int = 0,
+    bbox: str | None = None,
+    split_columns: bool | None = None,
+    user_id: str = Depends(_require_auth),
+):
+    payload = await extract_mto_from_document(
+        document_id,
+        page_index=int(page_index),
+        bbox=bbox,
+        split_columns=split_columns,
+        user_id=user_id,
+    )
+    rows = (payload or {}).get("items") or []
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(
+        buf,
+        fieldnames=["item", "material", "description", "nps", "qty_value", "qty_unit", "source"],
+        extrasaction="ignore",
+    )
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+
+    out = buf.getvalue().encode("utf-8")
+    headers = {"Content-Disposition": "attachment; filename=materials_take_off.csv"}
+    return StreamingResponse(iter([out]), media_type="text/csv; charset=utf-8", headers=headers)
+
+
+@app.post("/api/documents/{document_id}/convert-to-pdf", response_model=Document)
+async def convert_document_image_to_pdf(document_id: str, user_id: str = Depends(_require_auth)):
+    svc = get_supabase_service()
+    d = _require_doc_owner(svc, document_id, user_id)
+    file_kind = (str(d.get("file_kind") or "").strip().lower() or "pdf")
+    storage_path = str(d.get("storage_path") or "")
+    if not storage_path:
+        raise HTTPException(status_code=400, detail="storage_path kosong")
+
+    if file_kind != "image":
+        raise HTTPException(status_code=400, detail="Dokumen ini bukan gambar")
+
+    raw = await _download_document_bytes(svc, storage_path)
+    logger.info("convert_to_pdf: doc=%s", document_id)
+    try:
+        pdf_bytes = convert_image_bytes_to_pdf(raw)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Konversi gambar ke PDF gagal: {e}")
+
+    new_id = str(uuid4())
+    project_id = str(d.get("project_id"))
+    filename = f"{new_id}.pdf"
+    new_storage_path = f"{user_id}/{project_id}/{new_id}/{filename}"
+    now = datetime.utcnow().isoformat()
+    row = {
+        "id": new_id,
+        "project_id": project_id,
+        "owner_id": user_id,
+        "storage_path": new_storage_path,
+        "filename": filename,
+        "document_type": "Lainnya",
+        "document_number": None,
+        "document_date": None,
+        "status": "uploaded",
+        "uploaded_at": now,
+        "file_kind": "pdf",
+        "mime_type": "application/pdf",
+        "file_size_bytes": len(pdf_bytes),
+        "image_width": None,
+        "image_height": None,
+        "original_filename": d.get("original_filename") or d.get("filename"),
+    }
+
+    _ensure_storage_bucket(svc)
+    storage = svc.storage.from_(settings.supabase_bucket)
+    try:
+        storage.upload(new_storage_path, pdf_bytes, cast(Any, _storage_file_options("application/pdf")))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Upload PDF hasil konversi gagal: {e}")
+
+    ins = svc.table("documents").insert(row).execute()
+    if ins is None or not ins.data:
+        raise HTTPException(status_code=500, detail="Simpan metadata dokumen gagal")
+
+    try:
+        signed = storage.create_signed_url(new_storage_path, settings.signed_url_expires_seconds)
+        row["download_url"] = signed.get("signedURL")
+    except Exception:
+        row["download_url"] = None
+
+    return Document(**row)
+
+
+@app.post("/api/mto")
+async def extract_mto(
+    pdf: UploadFile = File(...),
+    page_index: int = Form(5),
+    bbox: str | None = Form(None),
+    split_columns: bool | None = Form(None),
+):
+    try:
+        pdf_bytes = await pdf.read()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Gagal membaca file")
+
+    try:
+        rows = extract_mto_from_pdf_bytes_advanced(
+            pdf_bytes,
+            int(page_index),
+            bbox=_parse_bbox(bbox),
+            split_columns=split_columns,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"items": rows}
+
+
+@app.post("/api/mto/csv")
+async def extract_mto_csv(
+    pdf: UploadFile = File(...),
+    page_index: int = Form(5),
+    bbox: str | None = Form(None),
+    split_columns: bool | None = Form(None),
+):
+    try:
+        pdf_bytes = await pdf.read()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Gagal membaca file")
+
+    try:
+        rows = extract_mto_from_pdf_bytes_advanced(
+            pdf_bytes,
+            int(page_index),
+            bbox=_parse_bbox(bbox),
+            split_columns=split_columns,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(
+        buf,
+        fieldnames=["item", "material", "description", "nps", "qty_value", "qty_unit", "source"],
+        extrasaction="ignore",
+    )
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+
+    out = buf.getvalue().encode("utf-8")
+    headers = {"Content-Disposition": "attachment; filename=materials_take_off.csv"}
+    return StreamingResponse(iter([out]), media_type="text/csv; charset=utf-8", headers=headers)
 
 
 @app.exception_handler(HTTPException)

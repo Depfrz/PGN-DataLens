@@ -82,6 +82,12 @@ class Document(BaseModel):
     document_date: date | None
     status: DocumentStatus
     uploaded_at: datetime
+    file_kind: str | None = None
+    mime_type: str | None = None
+    file_size_bytes: int | None = None
+    image_width: int | None = None
+    image_height: int | None = None
+    original_filename: str | None = None
     download_url: str | None = None
 
 

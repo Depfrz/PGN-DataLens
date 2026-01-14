@@ -1,12 +1,90 @@
 from __future__ import annotations
 
 import io
+import os
 import re
+import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, cast
 
 import fitz
-from PIL import Image
+from PIL import Image, ImageOps
+
+
+_ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".tif", ".tiff"}
+_ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/tiff"}
+_ALLOWED_PDF_EXTS = {".pdf"}
+_ALLOWED_PDF_MIMES = {"application/pdf"}
+
+logger = logging.getLogger("pgn_datalens.extraction")
+
+
+def _is_pdf_bytes(data: bytes) -> bool:
+    if not data:
+        return False
+    head = data.lstrip()[:8]
+    return head.startswith(b"%PDF-")
+
+
+def _detect_image_format(data: bytes) -> tuple[str | None, int | None, int | None]:
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    except Exception:
+        return None, None, None
+    fmt = (img.format or "").upper() or None
+    w, h = img.size
+    return fmt, int(w), int(h)
+
+
+def detect_upload_kind(
+    file_bytes: bytes,
+    *,
+    filename: str,
+    content_type: str | None,
+) -> str:
+    name = (filename or "").strip()
+    ext = ("." + name.split(".")[-1]).lower() if "." in name else ""
+    ct = (content_type or "").strip().lower() or None
+
+    pdf_sig = _is_pdf_bytes(file_bytes)
+    img_fmt, _, _ = _detect_image_format(file_bytes)
+    img_ok = img_fmt in {"PNG", "JPEG", "GIF", "TIFF"}
+
+    if ext in _ALLOWED_PDF_EXTS:
+        if pdf_sig:
+            return "pdf"
+        raise ValueError("File berekstensi .pdf tetapi kontennya bukan PDF")
+
+    if ext in _ALLOWED_IMAGE_EXTS:
+        if img_ok:
+            return "image"
+        raise ValueError("File berekstensi gambar tetapi kontennya bukan JPEG/PNG/GIF/TIFF")
+
+    if ext == "":
+        if pdf_sig:
+            return "pdf"
+        if img_ok:
+            return "image"
+        if ct in _ALLOWED_PDF_MIMES:
+            raise ValueError("MIME type application/pdf tetapi konten tidak terdeteksi sebagai PDF")
+        if ct in _ALLOWED_IMAGE_MIMES:
+            raise ValueError("MIME type gambar tetapi konten tidak terdeteksi sebagai JPEG/PNG/GIF/TIFF")
+        raise ValueError("File tanpa ekstensi dan tipe file tidak dapat dideteksi")
+
+    if pdf_sig:
+        raise ValueError("Ekstensi file tidak sesuai: konten PDF tetapi ekstensi bukan .pdf")
+    if img_ok:
+        raise ValueError("Ekstensi file tidak sesuai: konten gambar tetapi ekstensi bukan .jpg/.jpeg/.png/.gif/.tif/.tiff")
+    raise ValueError("Format tidak didukung. Gunakan PDF/JPG/JPEG/PNG/GIF/TIFF")
+
+
+class _MuPDFPage(Protocol):
+    rect: Any
+
+    def get_text(self, option: str, *args: Any, **kwargs: Any) -> Any: ...
+
+    def get_pixmap(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 @dataclass
@@ -44,8 +122,52 @@ def _normalize_unit(unit: str | None) -> str | None:
 def _parse_number(raw: str) -> float | None:
     if not raw:
         return None
+
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    s = re.sub(r"[^0-9,\.\-+]", "", s)
+    if not re.search(r"\d", s):
+        return None
+
+    last_dot = s.rfind(".")
+    last_comma = s.rfind(",")
+
+    if last_dot != -1 and last_comma != -1:
+        decimal_sep = "." if last_dot > last_comma else ","
+        thousand_sep = "," if decimal_sep == "." else "."
+        s = s.replace(thousand_sep, "")
+        s = s.replace(decimal_sep, ".")
+    elif last_dot != -1:
+        parts = s.split(".")
+        if len(parts) >= 3:
+            if all(len(p) == 3 for p in parts[1:]):
+                s = "".join(parts)
+            else:
+                s = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            a, b = parts[0], parts[1]
+            if len(b) == 3 and len(a) <= 3:
+                s = a + b
+            else:
+                s = a + "." + b
+    elif last_comma != -1:
+        parts = s.split(",")
+        if len(parts) >= 3:
+            if all(len(p) == 3 for p in parts[1:]):
+                s = "".join(parts)
+            else:
+                s = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            a, b = parts[0], parts[1]
+            if len(b) == 3 and len(a) <= 3:
+                s = a + b
+            else:
+                s = a + "." + b
+
     try:
-        return float(raw.replace(",", "."))
+        return float(s)
     except Exception:
         return None
 
@@ -191,7 +313,7 @@ def parse_materials_from_pdf_bytes(file_bytes: bytes, max_rows: int = 5000) -> t
         if len(rows) >= max_rows:
             break
         start_idx = len(rows)
-        page = doc[page_index]
+        page = cast(_MuPDFPage, doc[page_index])
         words = page.get_text("words") or []
         if not words:
             continue
@@ -418,7 +540,7 @@ def extract_pdf_text(file_bytes: bytes) -> str:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     parts: list[str] = []
     for page in doc:
-        t = page.get_text("text") or ""
+        t = cast(_MuPDFPage, page).get_text("text") or ""
         if t.strip():
             parts.append(t)
     return "\n".join(parts)
@@ -429,7 +551,202 @@ def _try_import_pytesseract():
         import pytesseract
     except Exception:
         return None
+
+    cmd = (os.getenv("TESSERACT_CMD") or "").strip()
+    if cmd and os.path.exists(cmd):
+        try:
+            pytesseract.pytesseract.tesseract_cmd = cmd
+        except Exception:
+            pass
     return pytesseract
+
+
+def validate_and_convert_image_upload(
+    file_bytes: bytes,
+    *,
+    filename: str,
+    content_type: str | None,
+    max_bytes: int = 5 * 1024 * 1024,
+    min_width: int = 300,
+    min_height: int = 300,
+) -> tuple[bytes, int, int, str]:
+    if not file_bytes:
+        raise ValueError("File kosong")
+
+    if len(file_bytes) > max_bytes:
+        raise ValueError("Ukuran file melebihi 5MB")
+
+    name = (filename or "").strip()
+    ext = ("." + name.split(".")[-1]).lower() if "." in name else ""
+    ct = (content_type or "").strip().lower() or None
+
+    if ext and ext not in _ALLOWED_IMAGE_EXTS:
+        raise ValueError("Format tidak didukung. Gunakan JPG/JPEG/PNG/GIF/TIFF")
+
+    if ct and ct not in _ALLOWED_IMAGE_MIMES:
+        raise ValueError("MIME type tidak didukung. Gunakan image/jpeg, image/png, image/gif, atau image/tiff")
+
+    if ext and ct:
+        mime_by_ext = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".tif": "image/tiff",
+            ".tiff": "image/tiff",
+        }
+        expected = mime_by_ext.get(ext)
+        if expected and ct != expected:
+            raise ValueError(f"MIME type tidak sesuai dengan ekstensi file (diharapkan {expected})")
+
+    try:
+        img = Image.open(io.BytesIO(file_bytes))
+        img.load()
+    except Exception as e:
+        raise ValueError(f"Gagal membaca gambar: {e}")
+
+    fmt = (img.format or "").upper()
+    if fmt not in {"PNG", "JPEG", "GIF", "TIFF"}:
+        raise ValueError("Format gambar tidak didukung. Gunakan JPG/JPEG/PNG/GIF/TIFF")
+
+    try:
+        if getattr(img, "n_frames", 1) > 1:
+            img.seek(0)
+    except Exception:
+        pass
+
+    w, h = img.size
+    if w < min_width or h < min_height:
+        raise ValueError(f"Resolusi minimal {min_width}x{min_height} piksel")
+
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA" if "A" in img.mode else "RGB")
+
+    buf = io.BytesIO()
+    try:
+        img.save(buf, format="PNG", optimize=True, compress_level=9)
+    except Exception as e:
+        raise ValueError(f"Konversi gambar gagal: {e}")
+
+    out = buf.getvalue()
+    if len(out) > max_bytes:
+        raise ValueError("Ukuran file melebihi 5MB setelah konversi")
+
+    return out, int(w), int(h), "image/png"
+
+
+def convert_image_bytes_to_pdf(image_bytes: bytes) -> bytes:
+    if not image_bytes:
+        raise ValueError("File kosong")
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load()
+    except Exception as e:
+        raise ValueError(f"Gagal membaca gambar: {e}")
+
+    frames: list[Image.Image] = []
+    try:
+        n = int(getattr(img, "n_frames", 1) or 1)
+    except Exception:
+        n = 1
+    for i in range(max(1, n)):
+        try:
+            if n > 1:
+                img.seek(i)
+        except Exception:
+            break
+        fr = img.convert("RGB")
+        frames.append(fr)
+
+    if not frames:
+        raise ValueError("Gagal membaca frame gambar")
+
+    buf = io.BytesIO()
+    if len(frames) == 1:
+        frames[0].save(buf, format="PDF", resolution=300.0)
+    else:
+        frames[0].save(buf, format="PDF", save_all=True, append_images=frames[1:], resolution=300.0)
+    return buf.getvalue()
+
+
+def extract_mto_from_image_bytes_advanced(
+    image_bytes: bytes,
+    *,
+    bbox: tuple[float, float, float, float] | None = None,
+    split_columns: bool | None = None,
+    threshold: int = 185,
+    deskew: bool = True,
+) -> list[dict[str, Any]]:
+    pytesseract = _try_import_pytesseract()
+    if pytesseract is None:
+        raise RuntimeError("pytesseract tidak tersedia")
+    _ensure_tesseract_ready(pytesseract)
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load()
+    except Exception as e:
+        raise ValueError(f"Gagal membaca gambar: {e}")
+
+    try:
+        if getattr(img, "n_frames", 1) > 1:
+            img.seek(0)
+    except Exception:
+        pass
+
+    page_img = img.convert("RGB")
+    crop_img = page_img
+
+    if bbox is None:
+        small = page_img.resize((max(1, page_img.size[0] // 2), max(1, page_img.size[1] // 2)))
+        small_pp = _preprocess_for_ocr(small, threshold=min(210, threshold + 10), upscale=1.0)
+        if deskew:
+            small_pp = _maybe_rotate_with_osd(pytesseract, small_pp)
+        tokens_small = _image_to_tokens(pytesseract, small_pp, psm=6)
+        found = _find_mto_bbox_from_tokens(tokens_small, small.size[0], small.size[1])
+        if found is not None:
+            x0, y0, x1, y1 = found
+            scale_x = page_img.size[0] / small.size[0]
+            scale_y = page_img.size[1] / small.size[1]
+            bbox = (x0 * scale_x, y0 * scale_y, x1 * scale_x, y1 * scale_y)
+
+    if bbox is not None:
+        x0, y0, x1, y1 = bbox
+        x0i = max(0, min(page_img.size[0], int(x0)))
+        y0i = max(0, min(page_img.size[1], int(y0)))
+        x1i = max(0, min(page_img.size[0], int(x1)))
+        y1i = max(0, min(page_img.size[1], int(y1)))
+        if x1i - x0i >= 10 and y1i - y0i >= 10:
+            crop_img = page_img.crop((x0i, y0i, x1i, y1i))
+
+    pp = _preprocess_for_ocr(crop_img, threshold=threshold, upscale=2.0)
+    if deskew:
+        pp = _maybe_rotate_with_osd(pytesseract, pp)
+
+    tokens = _image_to_tokens(pytesseract, pp, psm=6)
+    w, h = pp.size
+    split = split_columns if split_columns is not None else _split_columns_if_needed(tokens, w)
+    if not split:
+        return _tokens_to_rows(tokens, w, h, source="source=image")
+
+    mid = w // 2
+    left_img = pp.crop((0, 0, mid, h))
+    right_img = pp.crop((mid, 0, w, h))
+    left_tokens = _image_to_tokens(pytesseract, left_img, psm=6)
+    right_tokens = _image_to_tokens(pytesseract, right_img, psm=6)
+    left_rows = _tokens_to_rows(left_tokens, left_img.size[0], left_img.size[1], source="source=image,side=left")
+    right_rows = _tokens_to_rows(right_tokens, right_img.size[0], right_img.size[1], source="source=image,side=right")
+    merged: dict[int, dict[str, Any]] = {}
+    for r in left_rows + right_rows:
+        k = int(r["item"])
+        prev = merged.get(k)
+        if prev is None:
+            merged[k] = r
+            continue
+        for kk in ["material", "description", "nps", "qty_value", "qty_unit"]:
+            if prev.get(kk) in (None, "") and r.get(kk) not in (None, ""):
+                prev[kk] = r.get(kk)
+    return [merged[k] for k in sorted(merged.keys())]
 
 
 def ocr_pdf_text(file_bytes: bytes, max_pages: int = 15) -> tuple[str, str | None]:
@@ -442,7 +759,7 @@ def ocr_pdf_text(file_bytes: bytes, max_pages: int = 15) -> tuple[str, str | Non
     pages = min(len(doc), max_pages)
 
     for i in range(pages):
-        page = doc[i]
+        page = cast(_MuPDFPage, doc[i])
         pix = page.get_pixmap(dpi=200)
         img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
         try:
@@ -453,6 +770,421 @@ def ocr_pdf_text(file_bytes: bytes, max_pages: int = 15) -> tuple[str, str | Non
             out.append(txt)
 
     return "\n".join(out), None
+
+
+@dataclass(frozen=True)
+class _OCRToken:
+    text: str
+    x: int
+    y: int
+    w: int
+    h: int
+    conf: int
+
+    @property
+    def x_center(self) -> float:
+        return self.x + (self.w / 2.0)
+
+    @property
+    def y_center(self) -> float:
+        return self.y + (self.h / 2.0)
+
+
+def _ensure_tesseract_ready(pytesseract) -> None:
+    try:
+        _ = pytesseract.get_tesseract_version()
+    except Exception as e:
+        raise RuntimeError(
+            "Tesseract OCR tidak terdeteksi. Install Tesseract dan pastikan tesseract.exe ada di PATH, "
+            "atau set env TESSERACT_CMD ke path tesseract.exe."
+        ) from e
+
+
+def _render_pdf_page_to_image(pdf_bytes: bytes, page_index: int, dpi: int) -> Image.Image:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if page_index < 0 or page_index >= len(doc):
+        raise ValueError(f"page_index di luar range: {page_index} (pages={len(doc)})")
+
+    page = cast(_MuPDFPage, doc[page_index])
+    zoom = max(1.0, float(dpi) / 72.0)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    return img
+
+
+def _preprocess_for_ocr(img: Image.Image, *, threshold: int = 185, upscale: float = 2.0) -> Image.Image:
+    g = img.convert("L")
+    g = ImageOps.autocontrast(g)
+    if upscale and upscale != 1.0:
+        w, h = g.size
+        g = g.resize((max(1, int(w * upscale)), max(1, int(h * upscale))), resample=Image.Resampling.LANCZOS)
+    bw = g.point(lambda p: 255 if p >= threshold else 0)
+    return bw
+
+
+def _maybe_rotate_with_osd(pytesseract, img: Image.Image) -> Image.Image:
+    try:
+        osd = pytesseract.image_to_osd(img)
+    except Exception:
+        return img
+
+    m = re.search(r"Rotate:\s*(\d+)", osd)
+    if not m:
+        return img
+    deg = int(m.group(1))
+    if deg not in (90, 180, 270):
+        return img
+    return img.rotate(-deg, expand=True)
+
+
+def _image_to_tokens(pytesseract, img: Image.Image, *, psm: int = 6, lang: str = "eng") -> list[_OCRToken]:
+    from pytesseract import Output
+
+    data = pytesseract.image_to_data(
+        img,
+        output_type=Output.DICT,
+        lang=lang,
+        config=f"--oem 3 --psm {int(psm)}",
+    )
+    n = len(data.get("text", []) or [])
+    out: list[_OCRToken] = []
+    for i in range(n):
+        txt = str((data.get("text") or [""])[i]).strip()
+        if not txt:
+            continue
+        try:
+            conf = int(float((data.get("conf") or ["-1"])[i]))
+        except Exception:
+            conf = -1
+        try:
+            x = int((data.get("left") or [0])[i])
+            y = int((data.get("top") or [0])[i])
+            w = int((data.get("width") or [0])[i])
+            h = int((data.get("height") or [0])[i])
+        except Exception:
+            continue
+        out.append(_OCRToken(text=txt, x=x, y=y, w=w, h=h, conf=conf))
+    return out
+
+
+def _find_mto_bbox_from_tokens(tokens: list[_OCRToken], img_w: int, img_h: int) -> tuple[int, int, int, int] | None:
+    if not tokens:
+        return None
+    tks = [t for t in tokens if t.conf >= 20]
+    if not tks:
+        return None
+
+    upper = [t.text.upper() for t in tks]
+    best: tuple[int, int, int, int] | None = None
+
+    def _set_best(y_bottom: int):
+        nonlocal best
+        top = max(0, min(img_h - 1, y_bottom + int(img_h * 0.01)))
+        best = (0, top, img_w, img_h)
+
+    for i, u in enumerate(upper):
+        if u == "MTO":
+            _set_best(tks[i].y + tks[i].h)
+            break
+
+    if best is not None:
+        return best
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^A-Z0-9]+", "", (s or "").upper())
+
+    normed = [_norm(t.text) for t in tks]
+    for i, nu in enumerate(normed):
+        if nu not in ("MATERIALS", "MATERIAL"):
+            continue
+        y = tks[i].y_center
+        seen_take = False
+        seen_takes = False
+        seen_off = False
+        y_bottom = tks[i].y + tks[i].h
+        for ii in range(i + 1, min(i + 10, len(tks))):
+            if abs(tks[ii].y_center - y) > 30:
+                continue
+            n2 = normed[ii]
+            if n2 == "TAKE":
+                seen_take = True
+                y_bottom = max(y_bottom, tks[ii].y + tks[ii].h)
+            elif n2 == "TAKES":
+                seen_takes = True
+                y_bottom = max(y_bottom, tks[ii].y + tks[ii].h)
+            elif n2 == "OFF":
+                seen_off = True
+                y_bottom = max(y_bottom, tks[ii].y + tks[ii].h)
+        if (seen_take or seen_takes) and seen_off:
+            _set_best(y_bottom)
+            return best
+
+    return None
+
+
+def _split_columns_if_needed(tokens: list[_OCRToken], img_w: int) -> bool:
+    items = []
+    for t in tokens:
+        if t.conf < 40:
+            continue
+        if not re.fullmatch(r"\d{1,3}", t.text):
+            continue
+        try:
+            v = int(t.text)
+        except Exception:
+            continue
+        if 1 <= v <= 500:
+            items.append(t)
+
+    if len(items) < 8:
+        return False
+
+    left = sum(1 for t in items if t.x < int(img_w * 0.45))
+    right = sum(1 for t in items if t.x > int(img_w * 0.55))
+    return left >= 3 and right >= 3
+
+
+def _compute_column_bounds(tokens: list[_OCRToken], img_w: int, img_h: int) -> dict[str, int]:
+    default = {
+        "item_end": int(img_w * 0.12),
+        "material_end": int(img_w * 0.26),
+        "description_end": int(img_w * 0.74),
+        "nps_end": int(img_w * 0.86),
+        "qty_end": img_w,
+    }
+    if not tokens:
+        return default
+
+    header = [t for t in tokens if t.conf >= 15 and t.y < int(img_h * 0.25)]
+    if not header:
+        return default
+
+    def _norm_label(s: str) -> str:
+        return re.sub(r"[^A-Z0-9]+", "", (s or "").upper())
+
+    header_norm = [(_norm_label(t.text), t) for t in header]
+
+    def _center_for_any(labels: list[str]) -> float | None:
+        want = {_norm_label(l) for l in labels}
+        cands = [t for (n, t) in header_norm if n in want]
+        if not cands:
+            return None
+        t = min(cands, key=lambda x: x.y)
+        return t.x_center
+
+    item_c = _center_for_any(["ITEM", "NO", "NO.", "NUMBER"]) 
+    mat_c = _center_for_any(["MATERIAL", "MATL"]) 
+    desc_c = _center_for_any(["DESCRIPTION", "DESC"]) 
+    nps_c = _center_for_any(["NPS"]) 
+    qty_c = _center_for_any(["QTY", "QUANTITY", "Q'TY", "QT'Y", "QTY."])
+
+    bounds = dict(default)
+    if item_c is not None and mat_c is not None:
+        bounds["item_end"] = int((item_c + mat_c) / 2)
+    if mat_c is not None and desc_c is not None:
+        bounds["material_end"] = int((mat_c + desc_c) / 2)
+    if desc_c is not None and nps_c is not None:
+        bounds["description_end"] = int((desc_c + nps_c) / 2)
+    if nps_c is not None and qty_c is not None:
+        bounds["nps_end"] = int((nps_c + qty_c) / 2)
+    return bounds
+
+
+def _parse_qty(text: str) -> tuple[float | None, str | None]:
+    t = (text or "").strip()
+    if not t:
+        return None, None
+    m = re.search(r"([-+]?\d[\d\.,]*)\s*([A-Za-z]{1,6})?", t)
+    if not m:
+        return None, None
+    num = _parse_number(m.group(1) or "")
+    unit = (m.group(2) or "").strip() or None
+    if unit is not None:
+        unit = unit.lower()
+    return num, unit
+
+
+def _tokens_to_rows(tokens: list[_OCRToken], img_w: int, img_h: int, *, source: str) -> list[dict[str, Any]]:
+    clean = [t for t in tokens if t.conf >= 30 and t.text.strip()]
+    if not clean:
+        return []
+
+    bounds = _compute_column_bounds(clean, img_w, img_h)
+    item_end = bounds["item_end"]
+
+    items = []
+    for t in clean:
+        if t.x >= item_end:
+            continue
+        if not re.fullmatch(r"\d{1,3}", t.text):
+            continue
+        try:
+            v = int(t.text)
+        except Exception:
+            continue
+        if 1 <= v <= 999:
+            items.append((v, t))
+
+    if not items:
+        return []
+
+    items.sort(key=lambda it: (it[1].y, it[1].x))
+    anchors: list[tuple[int, _OCRToken]] = []
+    for v, t in items:
+        if not anchors:
+            anchors.append((v, t))
+            continue
+        _, last = anchors[-1]
+        if abs(t.y_center - last.y_center) <= max(12, int(last.h * 0.8)):
+            if t.x < last.x or (t.conf > last.conf and abs(t.x - last.x) <= 6):
+                anchors[-1] = (v, t)
+            continue
+        anchors.append((v, t))
+
+    rows: list[dict[str, Any]] = []
+    for idx, (item_no, anchor) in enumerate(anchors):
+        y_top = max(0, int(anchor.y - anchor.h * 0.6))
+        if idx + 1 < len(anchors):
+            next_anchor = anchors[idx + 1][1]
+            y_bottom = max(y_top + 1, int(next_anchor.y - next_anchor.h * 0.6))
+        else:
+            y_bottom = min(img_h, int(anchor.y + anchor.h * 4.0))
+        if y_bottom <= y_top:
+            continue
+
+        band = [t for t in clean if (y_top <= t.y_center < y_bottom)]
+        cols: dict[str, list[_OCRToken]] = {
+            "material": [],
+            "description": [],
+            "nps": [],
+            "qty": [],
+        }
+
+        for t in band:
+            if t is anchor:
+                continue
+            x = t.x_center
+            if x < item_end:
+                continue
+            if x < bounds["material_end"]:
+                cols["material"].append(t)
+            elif x < bounds["description_end"]:
+                cols["description"].append(t)
+            elif x < bounds["nps_end"]:
+                cols["nps"].append(t)
+            else:
+                cols["qty"].append(t)
+
+        def _join(ts: list[_OCRToken]) -> str:
+            ts2 = sorted(ts, key=lambda z: (z.y, z.x))
+            return " ".join(x.text for x in ts2).strip()
+
+        material = _join(cols["material"]) or None
+        description = _join(cols["description"]) or None
+        nps = _join(cols["nps"]) or None
+        qty_raw = _join(cols["qty"]) or ""
+        qty_value, qty_unit = _parse_qty(qty_raw)
+
+        rows.append(
+            {
+                "item": int(item_no),
+                "material": material,
+                "description": description,
+                "nps": nps,
+                "qty_value": qty_value,
+                "qty_unit": qty_unit,
+                "source": source,
+            }
+        )
+
+    dedup: dict[int, dict[str, Any]] = {}
+    for r in rows:
+        key = int(r["item"])
+        prev = dedup.get(key)
+        if prev is None:
+            dedup[key] = r
+            continue
+        for k in ["material", "description", "nps", "qty_value", "qty_unit"]:
+            if prev.get(k) in (None, "") and r.get(k) not in (None, ""):
+                prev[k] = r.get(k)
+
+    return [dedup[k] for k in sorted(dedup.keys())]
+
+
+def extract_mto_from_pdf_bytes(pdf_bytes: bytes, page_index: int) -> list[dict[str, Any]]:
+    return extract_mto_from_pdf_bytes_advanced(pdf_bytes, page_index, bbox=None, split_columns=None)
+
+
+def extract_mto_from_pdf_bytes_advanced(
+    pdf_bytes: bytes,
+    page_index: int,
+    *,
+    bbox: tuple[float, float, float, float] | None = None,
+    split_columns: bool | None = None,
+    dpi: int = 500,
+    threshold: int = 185,
+    deskew: bool = True,
+) -> list[dict[str, Any]]:
+    pytesseract = _try_import_pytesseract()
+    if pytesseract is None:
+        raise RuntimeError("pytesseract tidak tersedia")
+    _ensure_tesseract_ready(pytesseract)
+
+    page_img = _render_pdf_page_to_image(pdf_bytes, page_index, dpi)
+
+    crop_img = page_img
+    if bbox is None:
+        small = page_img.resize((max(1, page_img.size[0] // 2), max(1, page_img.size[1] // 2)))
+        small_pp = _preprocess_for_ocr(small, threshold=min(210, threshold + 10), upscale=1.0)
+        if deskew:
+            small_pp = _maybe_rotate_with_osd(pytesseract, small_pp)
+        tokens_small = _image_to_tokens(pytesseract, small_pp, psm=6)
+        found = _find_mto_bbox_from_tokens(tokens_small, small.size[0], small.size[1])
+        if found is not None:
+            x0, y0, x1, y1 = found
+            scale_x = page_img.size[0] / small.size[0]
+            scale_y = page_img.size[1] / small.size[1]
+            bbox = (x0 * scale_x, y0 * scale_y, x1 * scale_x, y1 * scale_y)
+
+    if bbox is not None:
+        x0, y0, x1, y1 = bbox
+        x0i = max(0, min(page_img.size[0], int(x0)))
+        y0i = max(0, min(page_img.size[1], int(y0)))
+        x1i = max(0, min(page_img.size[0], int(x1)))
+        y1i = max(0, min(page_img.size[1], int(y1)))
+        if x1i - x0i >= 10 and y1i - y0i >= 10:
+            crop_img = page_img.crop((x0i, y0i, x1i, y1i))
+
+    pp = _preprocess_for_ocr(crop_img, threshold=threshold, upscale=2.0)
+    if deskew:
+        pp = _maybe_rotate_with_osd(pytesseract, pp)
+
+    tokens = _image_to_tokens(pytesseract, pp, psm=6)
+    w, h = pp.size
+
+    split = split_columns if split_columns is not None else _split_columns_if_needed(tokens, w)
+    if not split:
+        return _tokens_to_rows(tokens, w, h, source=f"page={page_index + 1}")
+
+    mid = w // 2
+    left_img = pp.crop((0, 0, mid, h))
+    right_img = pp.crop((mid, 0, w, h))
+    left_tokens = _image_to_tokens(pytesseract, left_img, psm=6)
+    right_tokens = _image_to_tokens(pytesseract, right_img, psm=6)
+
+    left_rows = _tokens_to_rows(left_tokens, left_img.size[0], left_img.size[1], source=f"page={page_index + 1},side=left")
+    right_rows = _tokens_to_rows(right_tokens, right_img.size[0], right_img.size[1], source=f"page={page_index + 1},side=right")
+    merged: dict[int, dict[str, Any]] = {}
+    for r in left_rows + right_rows:
+        k = int(r["item"])
+        prev = merged.get(k)
+        if prev is None:
+            merged[k] = r
+            continue
+        for kk in ["material", "description", "nps", "qty_value", "qty_unit"]:
+            if prev.get(kk) in (None, "") and r.get(kk) not in (None, ""):
+                prev[kk] = r.get(kk)
+    return [merged[k] for k in sorted(merged.keys())]
 
 
 def detect_document_type(text: str) -> str:

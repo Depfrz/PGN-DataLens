@@ -1,9 +1,16 @@
 import unittest
 
-from backend.services.extraction import parse_materials
+from backend.services.extraction import _parse_number, parse_materials
 
 
 class MaterialParsingTests(unittest.TestCase):
+    def test_parse_number_handles_thousand_and_decimal_separators(self):
+        self.assertEqual(_parse_number("3.500"), 3500.0)
+        self.assertEqual(_parse_number("3.500,25"), 3500.25)
+        self.assertEqual(_parse_number("3,500.25"), 3500.25)
+        self.assertEqual(_parse_number("3500,25"), 3500.25)
+        self.assertEqual(_parse_number("1,234,567"), 1234567.0)
+        self.assertEqual(_parse_number("1.234.567"), 1234567.0)
     def test_parse_materials_merges_name_with_size_only_lines(self):
         text = """
         BALL VALVE

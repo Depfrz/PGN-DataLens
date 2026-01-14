@@ -122,6 +122,45 @@ function toast(message, type = 'info') {
   setTimeout(() => el.remove(), 2600)
 }
 
+function isImageFile(f) {
+  if (!f) return false
+  const t = (f.type || '').toLowerCase()
+  if (t === 'image/jpeg' || t === 'image/png' || t === 'image/gif' || t === 'image/tiff') return true
+  const name = (f.name || '').toLowerCase()
+  return (
+    name.endsWith('.jpg') ||
+    name.endsWith('.jpeg') ||
+    name.endsWith('.png') ||
+    name.endsWith('.gif') ||
+    name.endsWith('.tif') ||
+    name.endsWith('.tiff')
+  )
+}
+
+function isPdfFile(f) {
+  if (!f) return false
+  const t = (f.type || '').toLowerCase()
+  if (t === 'application/pdf') return true
+  const name = (f.name || '').toLowerCase()
+  return name.endsWith('.pdf')
+}
+
+async function getImageResolution(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const img = new Image()
+    img.onload = () => {
+      URL.revokeObjectURL(url)
+      resolve({ width: img.naturalWidth || 0, height: img.naturalHeight || 0 })
+    }
+    img.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('Gagal membaca resolusi gambar'))
+    }
+    img.src = url
+  })
+}
+
 function setRoute(hash) {
   window.location.hash = hash
 }
@@ -310,10 +349,15 @@ function projectView(state) {
           </div>
           <div class="flex items-center gap-2">
             ${d.download_url ? `<a class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800" target="_blank" href="${d.download_url}">View</a>` : ''}
-            <button data-extract="${d.id}" class="rounded-lg bg-blue-600 px-3 py-2 text-xs font-medium hover:bg-blue-500">Ekstrak</button>
+            <button data-extract="${d.id}" data-kind="${escapeHtml(d.file_kind || '')}" class="rounded-lg bg-blue-600 px-3 py-2 text-xs font-medium hover:bg-blue-500">Ekstrak</button>
+            ${d.file_kind === 'image' ? `<button data-mto="${d.id}" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800">OCR MTO</button>` : ''}
+            ${d.file_kind === 'image' ? `<button data-mto-csv="${d.id}" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800">MTO CSV</button>` : ''}
+            ${d.file_kind === 'image' ? `<button data-img2pdf="${d.id}" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800">Konversi PDF</button>` : ''}
             <button data-del-doc="${d.id}" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800">Hapus</button>
           </div>
         </div>
+        ${d.file_kind === 'image' && d.download_url ? `<div class="mt-3 overflow-hidden rounded-lg border border-slate-800 bg-slate-950/40"><img alt="${escapeHtml(d.filename)}" src="${d.download_url}" class="max-h-64 w-full object-contain" /></div>` : ''}
+        <div data-doc-out="${d.id}" class="mt-3 hidden rounded-lg border border-slate-800 bg-slate-950/40 p-3 text-xs text-slate-200"></div>
         <div class="mt-3 flex items-center justify-between">
           <div class="text-xs text-slate-400">Status: <span class="text-slate-200">${escapeHtml(d.status)}</span></div>
         </div>
@@ -336,10 +380,11 @@ function projectView(state) {
 
     <div class="mt-6 grid gap-4 md:grid-cols-3">
       <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-4 md:col-span-1">
-        <div class="text-sm font-semibold">Upload PDF</div>
-        <div class="mt-1 text-xs text-slate-400">Upload dokumen PDF untuk disimpan dan diekstrak.</div>
+        <div class="text-sm font-semibold">Upload Dokumen</div>
+        <div class="mt-1 text-xs text-slate-400">PDF untuk ekstraksi, atau gambar (JPG/JPEG/PNG) untuk preview.</div>
         <div class="mt-4 rounded-xl border border-dashed border-slate-700 bg-slate-950/30 p-4">
-          <input id="file" type="file" accept="application/pdf" class="block w-full text-sm" />
+          <input id="file" type="file" accept="application/pdf,image/png,image/jpeg,image/gif,image/tiff" class="block w-full text-sm" />
+          <div id="img-preview" class="mt-3 hidden overflow-hidden rounded-lg border border-slate-800 bg-slate-950/40"></div>
           <button id="btn-upload" class="mt-3 w-full rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium hover:bg-blue-500">Upload</button>
           <div id="upload-status" class="mt-3 text-xs text-slate-400"></div>
         </div>
@@ -695,13 +740,52 @@ async function render() {
           toast(e.message, 'error')
         }
       })
+
+      const fileEl = qs('#file')
+      const previewEl = qs('#img-preview')
+      if (fileEl && previewEl) {
+        fileEl.addEventListener('change', async () => {
+          previewEl.classList.add('hidden')
+          previewEl.innerHTML = ''
+          const f = fileEl.files && fileEl.files[0]
+          if (!f || !isImageFile(f)) return
+          const url = URL.createObjectURL(f)
+          previewEl.innerHTML = `<img src="${url}" class="max-h-56 w-full object-contain" />`
+          previewEl.classList.remove('hidden')
+        })
+      }
+
       qs('#btn-upload').addEventListener('click', async () => {
         const f = qs('#file').files[0]
         const statusEl = qs('#upload-status')
         if (!f) {
-          toast('Pilih file PDF dulu', 'error')
+          toast('Pilih file dulu', 'error')
           return
         }
+
+        if (!(isPdfFile(f) || isImageFile(f))) {
+          toast('Format tidak didukung. Gunakan PDF/JPG/JPEG/PNG/GIF/TIFF', 'error')
+          return
+        }
+
+        if (isImageFile(f)) {
+          const max = 5 * 1024 * 1024
+          if (f.size > max) {
+            toast('Ukuran file melebihi 5MB', 'error')
+            return
+          }
+          try {
+            const { width, height } = await getImageResolution(f)
+            if (width < 300 || height < 300) {
+              toast('Resolusi minimal 300x300 piksel', 'error')
+              return
+            }
+          } catch (e) {
+            toast(e.message, 'error')
+            return
+          }
+        }
+
         statusEl.textContent = 'Uploading...'
         const form = new FormData()
         form.append('file', f)
@@ -730,10 +814,141 @@ async function render() {
       qsa('[data-extract]').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const id = btn.getAttribute('data-extract')
+          const kind = (btn.getAttribute('data-kind') || '').toLowerCase()
+          if (kind === 'image') {
+            const out = qs(`[data-doc-out="${id}"]`)
+            if (out) {
+              out.classList.add('hidden')
+              out.textContent = ''
+            }
+            try {
+              toast('Menjalankan OCR MTO...', 'info')
+              const res = await api(`/api/documents/${id}/mto`, { method: 'POST' })
+              const items = (res && res.items) || []
+              const outputs = (res && res.outputs) || {}
+              const txtUrl = outputs.txt && outputs.txt.download_url
+              const csvUrl = outputs.csv && outputs.csv.download_url
+              if (out) {
+                const links = []
+                if (txtUrl) links.push(`<a class="underline" target="_blank" href="${txtUrl}">Download TXT</a>`)
+                if (csvUrl) links.push(`<a class="underline" target="_blank" href="${csvUrl}">Download CSV</a>`)
+                out.innerHTML = `${links.length ? `<div class="mb-2 flex gap-3">${links.join('')}</div>` : ''}<pre class="whitespace-pre-wrap">${escapeHtml(
+                  JSON.stringify(items, null, 2)
+                )}</pre>`
+                out.classList.remove('hidden')
+              }
+              toast(`OCR MTO selesai: ${items.length} baris`, 'success')
+            } catch (e) {
+              toast(e.message, 'error')
+            }
+            return
+          }
           try {
             toast('Ekstraksi dimulai...', 'info')
             await api(`/api/documents/${id}/extract`, { method: 'POST' })
             toast('Ekstraksi selesai', 'success')
+            render()
+          } catch (e) {
+            toast(e.message, 'error')
+          }
+        })
+      })
+
+      qsa('[data-mto]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = btn.getAttribute('data-mto')
+          if (!id) return
+          const out = qs(`[data-doc-out="${id}"]`)
+          if (out) {
+            out.classList.add('hidden')
+            out.textContent = ''
+          }
+          try {
+            toast('Menjalankan OCR MTO...', 'info')
+            const res = await api(`/api/documents/${id}/mto`, { method: 'POST' })
+            const items = (res && res.items) || []
+            const outputs = (res && res.outputs) || {}
+            const txtUrl = outputs.txt && outputs.txt.download_url
+            const csvUrl = outputs.csv && outputs.csv.download_url
+            if (out) {
+              const links = []
+              if (txtUrl) links.push(`<a class="underline" target="_blank" href="${txtUrl}">Download TXT</a>`)
+              if (csvUrl) links.push(`<a class="underline" target="_blank" href="${csvUrl}">Download CSV</a>`)
+              out.innerHTML = `${links.length ? `<div class="mb-2 flex gap-3">${links.join('')}</div>` : ''}<pre class="whitespace-pre-wrap">${escapeHtml(
+                JSON.stringify(items, null, 2)
+              )}</pre>`
+              out.classList.remove('hidden')
+            }
+            toast(`OCR MTO selesai: ${items.length} baris`, 'success')
+          } catch (e) {
+            toast(e.message, 'error')
+          }
+        })
+      })
+
+      qsa('[data-mto-csv]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = btn.getAttribute('data-mto-csv')
+          if (!id) return
+          try {
+            toast('Menyiapkan file CSV...', 'info')
+            const mto = await api(`/api/documents/${id}/mto`, { method: 'POST' })
+            const outputs = (mto && mto.outputs) || {}
+            const csvUrl = outputs.csv && outputs.csv.download_url
+            if (csvUrl) {
+              window.open(csvUrl, '_blank')
+              return
+            }
+
+            const token = getToken()
+            const res = await fetch(`/api/documents/${id}/mto/csv`, {
+              method: 'POST',
+              headers: token ? { Authorization: `Bearer ${token}` } : {},
+            })
+            if (!res.ok) {
+              const text = await res.text()
+              let msg = `HTTP ${res.status}`
+              try {
+                const j = text ? JSON.parse(text) : null
+                if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : j.detail.message || msg
+              } catch {
+                msg = text || msg
+              }
+              throw new Error(msg)
+            }
+            const blob = await res.blob()
+            const url = URL.createObjectURL(blob)
+            const a = document.createElement('a')
+            a.href = url
+            a.download = 'materials_take_off.csv'
+            document.body.appendChild(a)
+            a.click()
+            a.remove()
+            URL.revokeObjectURL(url)
+          } catch (e) {
+            toast(e.message, 'error')
+          }
+        })
+      })
+
+      qsa('[data-img2pdf]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = btn.getAttribute('data-img2pdf')
+          if (!id) return
+          const out = qs(`[data-doc-out="${id}"]`)
+          if (out) {
+            out.classList.add('hidden')
+            out.textContent = ''
+          }
+          try {
+            toast('Mengonversi gambar ke PDF...', 'info')
+            const res = await api(`/api/documents/${id}/convert-to-pdf`, { method: 'POST' })
+            const url = res && res.download_url
+            if (out) {
+              out.innerHTML = `${url ? `<a class="underline" target="_blank" href="${url}">Download PDF hasil konversi</a>` : ''}`
+              out.classList.remove('hidden')
+            }
+            toast('Konversi selesai. PDF baru ditambahkan ke daftar dokumen.', 'success')
             render()
           } catch (e) {
             toast(e.message, 'error')
