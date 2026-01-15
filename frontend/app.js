@@ -588,6 +588,7 @@ function projectView(state) {
             <option value="500">500</option>
           </select>
           <button id="btn-search" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm hover:bg-slate-800">Terapkan</button>
+          <button id="btn-mat-delete-all" class="rounded-lg border border-rose-700/60 bg-rose-950/30 px-3 py-2 text-sm text-rose-100 hover:bg-rose-900/30" disabled>Hapus Semua</button>
         </div>
       </div>
       <div class="mt-4 overflow-hidden rounded-xl border border-slate-800">
@@ -1027,6 +1028,35 @@ async function render() {
         matState.unit = qs('#mat-unit').value.trim()
         matState.limit = parseInt(qs('#mat-limit').value, 10) || 200
         await loadMaterials(true)
+      })
+
+      const deleteAllBtn = qs('#btn-mat-delete-all')
+      const matDocSel = qs('#mat-doc')
+      function syncDeleteAllEnabled() {
+        if (!deleteAllBtn || !matDocSel) return
+        deleteAllBtn.disabled = !(matDocSel.value || '').trim()
+      }
+      syncDeleteAllEnabled()
+      matDocSel?.addEventListener('change', syncDeleteAllEnabled)
+
+      deleteAllBtn?.addEventListener('click', async () => {
+        const docId = (matDocSel?.value || '').trim()
+        if (!docId) {
+          toast('Pilih dokumen dulu sebelum Hapus Semua', 'error')
+          return
+        }
+        const ok = window.confirm('Hapus semua material untuk dokumen ini? Tindakan ini tidak dapat dibatalkan.')
+        if (!ok) return
+        try {
+          deleteAllBtn.disabled = true
+          await api(`/api/documents/${docId}/materials`, { method: 'DELETE' })
+          toast('Semua material untuk dokumen dihapus', 'success')
+          await loadMaterials(true)
+        } catch (e) {
+          toast(e.message, 'error')
+        } finally {
+          syncDeleteAllEnabled()
+        }
       })
 
       ;['#mat-q', '#mat-size', '#mat-unit'].forEach((sel) => {

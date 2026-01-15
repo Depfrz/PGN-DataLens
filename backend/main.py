@@ -927,6 +927,21 @@ def delete_material(material_id: str, user_id: str = Depends(_require_auth)):
     return {"deleted": len(res.data or [])}
 
 
+@app.delete("/api/documents/{document_id}/materials")
+def delete_materials_for_document(document_id: str, user_id: str = Depends(_require_auth)):
+    svc = get_supabase_service()
+    doc = svc.table("documents").select("id").eq("id", document_id).eq("owner_id", user_id).limit(1).execute()
+    if doc is None:
+        raise HTTPException(status_code=500, detail="Gagal mengambil dokumen")
+    if not doc.data:
+        raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
+
+    res = svc.table("materials").delete().eq("document_id", document_id).eq("owner_id", user_id).execute()
+    if res is None:
+        raise HTTPException(status_code=500, detail="Gagal menghapus material")
+    return {"deleted": len(res.data or [])}
+
+
 @app.get("/api/documents/{document_id}")
 def get_document(document_id: str, user_id: str = Depends(_require_auth)):
     svc = get_supabase_service()
