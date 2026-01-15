@@ -100,6 +100,10 @@ async function api(path, opts = {}) {
       msg = detail.message || msg
       code = detail.code || null
     }
+    if (res.status === 404 && msg === 'Not Found' && String(path || '').startsWith('/api/')) {
+      msg =
+        'API tidak ditemukan (404). Pastikan backend FastAPI sudah direstart dan UI dibuka dari backend (mis. http://localhost:8000/), bukan dari Live Server.'
+    }
     const err = new Error(msg)
     err.code = code
     err.status = res.status
@@ -125,15 +129,13 @@ function toast(message, type = 'info') {
 function isImageFile(f) {
   if (!f) return false
   const t = (f.type || '').toLowerCase()
-  if (t === 'image/jpeg' || t === 'image/png' || t === 'image/gif' || t === 'image/tiff') return true
+  if (t === 'image/jpeg' || t === 'image/png' || t === 'image/webp') return true
   const name = (f.name || '').toLowerCase()
   return (
     name.endsWith('.jpg') ||
     name.endsWith('.jpeg') ||
     name.endsWith('.png') ||
-    name.endsWith('.gif') ||
-    name.endsWith('.tif') ||
-    name.endsWith('.tiff')
+    name.endsWith('.webp')
   )
 }
 
@@ -158,6 +160,162 @@ async function getImageResolution(file) {
       reject(new Error('Gagal membaca resolusi gambar'))
     }
     img.src = url
+  })
+}
+
+function formatBytes(n) {
+  const b = Number(n || 0)
+  if (!b || b < 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const i = Math.min(units.length - 1, Math.floor(Math.log(b) / Math.log(1024)))
+  const v = b / Math.pow(1024, i)
+  const txt = i === 0 ? String(Math.round(v)) : v.toFixed(v >= 10 ? 1 : 2)
+  return `${txt} ${units[i]}`
+}
+
+function extForMime(mime) {
+  const t = String(mime || '').toLowerCase()
+  if (t === 'image/png') return '.png'
+  if (t === 'image/webp') return '.webp'
+  return '.jpg'
+}
+
+async function resizeImageFileIfNeeded(file, { maxDim = 2000, maxBytes = 5 * 1024 * 1024 } = {}) {
+  const { width, height } = await getImageResolution(file)
+  if (!width || !height) throw new Error('Gagal membaca resolusi gambar')
+  if (width <= maxDim && height <= maxDim) return { file, resized: false, width, height }
+
+  const scale = Math.min(1, maxDim / width, maxDim / height)
+  const targetW = Math.max(1, Math.round(width * scale))
+  const targetH = Math.max(1, Math.round(height * scale))
+
+  let source = null
+  if (window.createImageBitmap) {
+    try {
+      source = await createImageBitmap(file, { imageOrientation: 'from-image' })
+    } catch {
+      source = await createImageBitmap(file)
+    }
+  }
+
+  const canvas = document.createElement('canvas')
+  canvas.width = targetW
+  canvas.height = targetH
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Browser tidak mendukung Canvas')
+
+  if (source) {
+    ctx.drawImage(source, 0, 0, targetW, targetH)
+    try {
+      source.close && source.close()
+    } catch {}
+  } else {
+    const url = URL.createObjectURL(file)
+    try {
+      const img = await new Promise((resolve, reject) => {
+        const el = new Image()
+        el.onload = () => resolve(el)
+        el.onerror = () => reject(new Error('Gagal memuat gambar untuk resize'))
+        el.src = url
+      })
+      ctx.drawImage(img, 0, 0, targetW, targetH)
+    } finally {
+      URL.revokeObjectURL(url)
+    }
+  }
+
+  const preferred = ['image/jpeg', 'image/png', 'image/webp'].includes(String(file.type || '').toLowerCase())
+    ? String(file.type || '').toLowerCase()
+    : 'image/jpeg'
+
+  async function canvasToBlob(type, quality) {
+    return await new Promise((resolve) => {
+      try {
+        canvas.toBlob((b) => resolve(b || null), type, quality)
+      } catch {
+        resolve(null)
+      }
+    })
+  }
+
+  let blob = await canvasToBlob(preferred, preferred === 'image/jpeg' ? 0.9 : 0.92)
+  if (!blob) blob = await canvasToBlob('image/jpeg', 0.9)
+  if (!blob) throw new Error('Gagal melakukan resize gambar')
+
+  if (blob.size > maxBytes) {
+    const qList = [0.85, 0.78, 0.7]
+    for (const q of qList) {
+      const b = await canvasToBlob('image/jpeg', q)
+      if (b && b.size <= maxBytes) {
+        blob = b
+        break
+      }
+    }
+  }
+
+  if (blob.size > maxBytes) {
+    throw new Error('Ukuran file melebihi 5MB setelah resize')
+  }
+
+  const base = (file.name || 'upload').replace(/\.[a-z0-9]+$/i, '')
+  const newName = `${base}${extForMime(blob.type)}`
+  const outFile = new File([blob], newName, { type: blob.type })
+  return { file: outFile, resized: true, width: targetW, height: targetH }
+}
+
+function uploadWithProgress(path, formData, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${API_BASE}${path}`, true)
+    const token = getToken()
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    xhr.responseType = 'text'
+
+    xhr.upload.onprogress = (ev) => {
+      if (!onProgress) return
+      if (ev.lengthComputable) onProgress(ev.loaded || 0, ev.total || 0)
+      else onProgress(ev.loaded || 0, null)
+    }
+
+    xhr.onload = () => {
+      const text = xhr.responseText || ''
+      let json = null
+      try {
+        json = text ? JSON.parse(text) : null
+      } catch {
+        json = null
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(json)
+        return
+      }
+      const detail = json && json.detail
+      let msg = `HTTP ${xhr.status}`
+      let code = null
+      if (typeof detail === 'string') msg = detail
+      else if (detail && typeof detail === 'object') {
+        msg = detail.message || msg
+        code = detail.code || null
+      } else if (text) msg = text
+      const err = new Error(msg)
+      err.code = code
+      err.status = xhr.status
+      reject(err)
+    }
+
+    xhr.onerror = () => {
+      const err = new Error('Upload gagal. Periksa koneksi dan coba lagi.')
+      err.status = 0
+      reject(err)
+    }
+
+    xhr.onabort = () => {
+      const err = new Error('Upload dibatalkan')
+      err.status = 0
+      reject(err)
+    }
+
+    xhr.send(formData)
   })
 }
 
@@ -349,9 +507,9 @@ function projectView(state) {
           </div>
           <div class="flex items-center gap-2">
             ${d.download_url ? `<a class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800" target="_blank" href="${d.download_url}">View</a>` : ''}
-            <button data-extract="${d.id}" data-kind="${escapeHtml(d.file_kind || '')}" class="rounded-lg bg-blue-600 px-3 py-2 text-xs font-medium hover:bg-blue-500">Ekstrak</button>
-            ${d.file_kind === 'image' ? `<button data-mto="${d.id}" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800">OCR MTO</button>` : ''}
-            ${d.file_kind === 'image' ? `<button data-mto-csv="${d.id}" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800">MTO CSV</button>` : ''}
+            ${d.file_kind !== 'image' ? `<button data-extract="${d.id}" class="rounded-lg bg-blue-600 px-3 py-2 text-xs font-medium hover:bg-blue-500">Ekstrak</button>` : ''}
+            <button data-mto-import="${d.id}" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800">OCR MTO</button>
+            <button data-mto-csv="${d.id}" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800">MTO CSV</button>
             ${d.file_kind === 'image' ? `<button data-img2pdf="${d.id}" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800">Konversi PDF</button>` : ''}
             <button data-del-doc="${d.id}" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800">Hapus</button>
           </div>
@@ -381,11 +539,19 @@ function projectView(state) {
     <div class="mt-6 grid gap-4 md:grid-cols-3">
       <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-4 md:col-span-1">
         <div class="text-sm font-semibold">Upload Dokumen</div>
-        <div class="mt-1 text-xs text-slate-400">PDF untuk ekstraksi, atau gambar (JPG/JPEG/PNG) untuk preview.</div>
+        <div class="mt-1 text-xs text-slate-400">PDF untuk ekstraksi, atau gambar (JPEG/PNG/WEBP) untuk preview.</div>
         <div class="mt-4 rounded-xl border border-dashed border-slate-700 bg-slate-950/30 p-4">
-          <input id="file" type="file" accept="application/pdf,image/png,image/jpeg,image/gif,image/tiff" class="block w-full text-sm" />
+          <input id="file" type="file" accept="application/pdf,image/png,image/jpeg,image/webp" class="block w-full text-sm" />
+          <div class="mt-2 text-[11px] text-slate-500">Maks ${escapeHtml(formatBytes(5 * 1024 * 1024))}. Format gambar: JPEG, PNG, WEBP. Gambar di atas 2000×2000 akan di-resize otomatis.</div>
           <div id="img-preview" class="mt-3 hidden overflow-hidden rounded-lg border border-slate-800 bg-slate-950/40"></div>
           <button id="btn-upload" class="mt-3 w-full rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium hover:bg-blue-500">Upload</button>
+          <button id="btn-upload-retry" class="mt-2 hidden w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm hover:bg-slate-800">Coba lagi</button>
+          <div id="upload-progress-wrap" class="mt-3 hidden">
+            <div class="h-2 w-full overflow-hidden rounded bg-slate-800">
+              <div id="upload-progress-bar" class="h-2 w-0 bg-blue-500"></div>
+            </div>
+            <div id="upload-progress-text" class="mt-1 text-[11px] text-slate-400"></div>
+          </div>
           <div id="upload-status" class="mt-3 text-xs text-slate-400"></div>
         </div>
       </div>
@@ -407,6 +573,12 @@ function projectView(state) {
           <div class="text-xs text-slate-400">Hasil ekstraksi akan masuk ke tabel ini.</div>
         </div>
         <div class="flex flex-wrap items-center justify-end gap-2">
+          <select id="mat-doc" class="w-56 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500/40">
+            <option value="">Semua dokumen</option>
+            ${(state.documents || [])
+              .map((d) => `<option value="${escapeHtml(d.id)}">${escapeHtml(d.filename)}</option>`)
+              .join('')}
+          </select>
           <input id="mat-q" placeholder="Cari..." class="w-44 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500/40" />
           <input id="mat-size" placeholder="Size" class="w-28 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500/40" />
           <input id="mat-unit" placeholder="Unit" class="w-24 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500/40" />
@@ -442,19 +614,33 @@ function projectView(state) {
 }
 
 function materialRowsHtml(materials) {
+  function badge(text, cls) {
+    return `<span class="inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] ${cls}">${escapeHtml(text)}</span>`
+  }
   return (materials || [])
     .map(
       (m) => `
-      <tr class="border-t border-slate-800/60">
+      <tr class="border-t border-slate-800/60 ${m.data_source === 'ocr' ? 'bg-amber-950/20' : ''}">
         <td class="px-3 py-3 align-top">
-          <div class="text-sm font-medium">${escapeHtml(m.description)}</div>
+          <div class="flex items-start gap-2">
+            <div class="text-sm font-medium">${escapeHtml(m.description)}</div>
+            <div class="mt-0.5 flex flex-wrap gap-1">
+              ${m.data_source === 'ocr' ? badge('OCR', 'border-amber-500/30 bg-amber-950/40 text-amber-100') : ''}
+              ${m.needs_review ? badge('Perlu Review', 'border-rose-500/30 bg-rose-950/40 text-rose-100') : ''}
+              ${m.verification_status === 'approved' ? badge('Terverifikasi', 'border-emerald-500/30 bg-emerald-950/40 text-emerald-100') : ''}
+              ${m.verification_status === 'rejected' ? badge('Ditolak', 'border-slate-600/60 bg-slate-900/60 text-slate-200') : ''}
+            </div>
+          </div>
         </td>
         <td class="px-3 py-3 align-top">${specBulletsHtml(m.spec)}</td>
         <td class="px-3 py-3 align-top text-sm text-slate-300">${escapeHtml(m.size || '-')}</td>
         <td class="px-3 py-3 align-top text-sm text-slate-300">${m.quantity == null ? '-' : m.quantity}</td>
         <td class="px-3 py-3 align-top text-sm text-slate-300">${escapeHtml(m.unit || '-')}</td>
         <td class="px-3 py-3 text-right">
-          <button data-del-mat="${m.id}" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800">Hapus</button>
+          <div class="flex items-center justify-end gap-2">
+            ${m.data_source === 'ocr' || m.needs_review ? `<button data-review-mat="${m.id}" class="rounded-lg border border-amber-600/40 bg-amber-950/30 px-3 py-2 text-xs text-amber-100 hover:bg-amber-900/30">Review</button>` : ''}
+            <button data-del-mat="${m.id}" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs hover:bg-slate-800">Hapus</button>
+          </div>
         </td>
       </tr>
     `
@@ -647,11 +833,148 @@ async function render() {
         q: '',
         size: '',
         unit: '',
+        documentId: '',
         sortBy: 'created_at',
         sortDir: 'desc',
         limit: 200,
         offset: 0,
         nextOffset: null
+      }
+
+      function modal(html) {
+        const wrap = document.createElement('div')
+        wrap.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4'
+        wrap.innerHTML = `<div class="w-full max-w-4xl rounded-2xl border border-slate-800 bg-slate-950 shadow-xl">${html}</div>`
+        document.body.appendChild(wrap)
+        function close() {
+          wrap.remove()
+        }
+        wrap.addEventListener('click', (ev) => {
+          if (ev.target === wrap) close()
+          const btn = ev.target.closest('[data-close]')
+          if (btn) close()
+        })
+        return { el: wrap, close }
+      }
+
+      async function openReview(materialId) {
+        const ctx = await api(`/api/materials/${materialId}/ocr-context`)
+        const hist = await api(`/api/materials/${materialId}/history`)
+        const mat = (ctx && ctx.material) || {}
+        const run = (ctx && ctx.ocr_run) || null
+        const ext = (ctx && ctx.ocr_extraction) || null
+        const doc = (documents || []).find((d) => d.id === mat.document_id) || null
+        const ocr = (ext && ext.normalized_fields) || {}
+        const flags = (ext && ext.flags && ext.flags.flags) || []
+
+        const m = modal(`
+          <div class="flex items-center justify-between border-b border-slate-800 px-5 py-4">
+            <div>
+              <div class="text-sm text-slate-400">Review OCR</div>
+              <div class="mt-1 text-lg font-semibold">${escapeHtml(mat.description || '-')}</div>
+            </div>
+            <button data-close class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm hover:bg-slate-800">Tutup</button>
+          </div>
+          <div class="grid gap-4 p-5 md:grid-cols-2">
+            <div class="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+              <div class="text-sm font-semibold">Nilai saat ini</div>
+              <div class="mt-3 grid gap-3">
+                <div>
+                  <label class="text-xs text-slate-400">Nama Item</label>
+                  <input id="rv-desc" class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm" value="${escapeHtml(mat.description || '')}" />
+                </div>
+                <div>
+                  <label class="text-xs text-slate-400">Spesifikasi</label>
+                  <textarea id="rv-spec" rows="5" class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm">${escapeHtml(mat.spec || '')}</textarea>
+                </div>
+                <div class="grid grid-cols-3 gap-3">
+                  <div>
+                    <label class="text-xs text-slate-400">Size</label>
+                    <input id="rv-size" class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm" value="${escapeHtml(mat.size || '')}" />
+                  </div>
+                  <div>
+                    <label class="text-xs text-slate-400">Quantity</label>
+                    <input id="rv-qty" class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm" value="${mat.quantity == null ? '' : escapeHtml(mat.quantity)}" />
+                  </div>
+                  <div>
+                    <label class="text-xs text-slate-400">Unit</label>
+                    <input id="rv-unit" class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm" value="${escapeHtml(mat.unit || '')}" />
+                  </div>
+                </div>
+                <div class="text-xs text-slate-500">Status: ${escapeHtml(mat.verification_status || 'draft')}</div>
+              </div>
+            </div>
+
+            <div class="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+              <div class="flex items-center justify-between">
+                <div class="text-sm font-semibold">Nilai OCR</div>
+                ${doc && doc.download_url ? `<a class="text-xs text-slate-300 underline hover:text-white" target="_blank" href="${doc.download_url}">Buka dokumen</a>` : ''}
+              </div>
+              <div class="mt-3 grid gap-2 text-sm">
+                <div class="flex items-center justify-between gap-3"><div class="text-slate-400">Nama Item</div><div class="text-right">${escapeHtml((ocr && ocr.description) || '-')}</div></div>
+                <div class="flex items-start justify-between gap-3"><div class="text-slate-400">Spesifikasi</div><div class="max-w-[60%] text-right text-xs text-slate-200">${specBulletsHtml((ocr && ocr.spec) || '')}</div></div>
+                <div class="flex items-center justify-between gap-3"><div class="text-slate-400">Size</div><div class="text-right">${escapeHtml((ocr && ocr.size) || '-')}</div></div>
+                <div class="flex items-center justify-between gap-3"><div class="text-slate-400">Quantity</div><div class="text-right">${(ocr && ocr.quantity) == null ? '-' : escapeHtml(ocr.quantity)}</div></div>
+                <div class="flex items-center justify-between gap-3"><div class="text-slate-400">Unit</div><div class="text-right">${escapeHtml((ocr && ocr.unit) || '-')}</div></div>
+              </div>
+              <div class="mt-4 rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                <div class="text-xs font-semibold text-slate-300">Metadata</div>
+                <div class="mt-2 text-xs text-slate-400">
+                  <div>OCR run: ${run ? escapeHtml(run.id) : '-'}</div>
+                  <div>Engine: ${run ? escapeHtml(run.engine_name || '-') : '-'} ${run ? escapeHtml(run.engine_version || '') : ''}</div>
+                  <div>Waktu: ${run ? escapeHtml(run.processed_at || '-') : '-'}</div>
+                  ${flags && flags.length ? `<div class="mt-2 text-rose-200">Flag: ${escapeHtml(flags.join(', '))}</div>` : '<div class="mt-2 text-slate-500">Tidak ada flag</div>'}
+                </div>
+              </div>
+
+              <div class="mt-4">
+                <div class="text-xs font-semibold text-slate-300">Histori</div>
+                <div class="mt-2 max-h-40 overflow-auto rounded-lg border border-slate-800 bg-slate-950/60 p-2 text-xs text-slate-300">
+                  ${(hist || [])
+                    .slice(0, 15)
+                    .map((h) => `<div class="border-b border-slate-800/60 py-2"><div class="text-slate-400">${escapeHtml(h.changed_at || '')} • ${escapeHtml(h.change_source || '')}</div><div class="mt-1 text-slate-200">${escapeHtml(JSON.stringify(h.after || {}))}</div></div>`)
+                    .join('') || '<div class="text-slate-500">Belum ada histori.</div>'}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="flex items-center justify-between border-t border-slate-800 px-5 py-4">
+            <div class="text-xs text-slate-500">Approve akan menandai item sebagai terverifikasi.</div>
+            <div class="flex items-center gap-2">
+              <button id="rv-reject" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm hover:bg-slate-800">Tolak</button>
+              <button id="rv-approve" class="rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium hover:bg-emerald-500">Approve</button>
+            </div>
+          </div>
+        `)
+
+        const approveBtn = qs('#rv-approve', m.el)
+        const rejectBtn = qs('#rv-reject', m.el)
+
+        async function submit(decision) {
+          const patch = {
+            description: qs('#rv-desc', m.el).value.trim(),
+            spec: qs('#rv-spec', m.el).value,
+            size: qs('#rv-size', m.el).value.trim() || null,
+            quantity: qs('#rv-qty', m.el).value.trim() ? Number(qs('#rv-qty', m.el).value.trim()) : null,
+            unit: qs('#rv-unit', m.el).value.trim() || null,
+          }
+          try {
+            await api(`/api/materials/${materialId}/review`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ decision, patch }),
+            })
+            toast(decision === 'approved' ? 'Item disetujui' : 'Item ditolak', 'success')
+            m.close()
+            await loadMaterials(true)
+          } catch (e) {
+            toast(e.message, 'error')
+          }
+        }
+
+        approveBtn.addEventListener('click', () => submit('approved'))
+        rejectBtn.addEventListener('click', () => submit('rejected'))
       }
 
       async function loadMaterials(reset = false) {
@@ -668,6 +991,7 @@ async function render() {
           }
 
           const url = `/api/projects/${projectId}/materials/page?` +
+            `document_id=${encodeURIComponent(matState.documentId)}&` +
             `q=${encodeURIComponent(matState.q)}&` +
             `size=${encodeURIComponent(matState.size)}&` +
             `unit=${encodeURIComponent(matState.unit)}&` +
@@ -697,6 +1021,7 @@ async function render() {
       })
 
       qs('#btn-search').addEventListener('click', async () => {
+        matState.documentId = qs('#mat-doc').value || ''
         matState.q = qs('#mat-q').value.trim()
         matState.size = qs('#mat-size').value.trim()
         matState.unit = qs('#mat-unit').value.trim()
@@ -727,6 +1052,18 @@ async function render() {
       })
 
       qs('#mat-tbody').addEventListener('click', async (ev) => {
+        const reviewBtn = ev.target.closest('[data-review-mat]')
+        if (reviewBtn) {
+          const id = reviewBtn.getAttribute('data-review-mat')
+          if (id) {
+            try {
+              await openReview(id)
+            } catch (e) {
+              toast(e.message, 'error')
+            }
+          }
+          return
+        }
         const btn = ev.target.closest('[data-del-mat]')
         if (!btn) return
         const id = btn.getAttribute('data-del-mat')
@@ -743,62 +1080,183 @@ async function render() {
 
       const fileEl = qs('#file')
       const previewEl = qs('#img-preview')
+      const uploadBtn = qs('#btn-upload')
+      const retryBtn = qs('#btn-upload-retry')
+      const statusEl = qs('#upload-status')
+      const progressWrap = qs('#upload-progress-wrap')
+      const progressBar = qs('#upload-progress-bar')
+      const progressText = qs('#upload-progress-text')
+      let lastPreparedFile = null
+      let uploading = false
+
+      function resetProgress() {
+        if (progressWrap) progressWrap.classList.add('hidden')
+        if (progressBar) progressBar.style.width = '0%'
+        if (progressText) progressText.textContent = ''
+      }
+
+      function setUploadingUi(isUploading) {
+        uploading = !!isUploading
+        if (uploadBtn) uploadBtn.disabled = uploading
+        if (fileEl) fileEl.disabled = uploading
+      }
+
+      function showRetry(show) {
+        if (!retryBtn) return
+        if (show) retryBtn.classList.remove('hidden')
+        else retryBtn.classList.add('hidden')
+      }
+
+      function setStatus(text) {
+        if (statusEl) statusEl.textContent = text || ''
+      }
+
+      async function doUpload(fileToSend) {
+        const form = new FormData()
+        form.append('file', fileToSend)
+        resetProgress()
+        showRetry(false)
+        if (progressWrap) progressWrap.classList.remove('hidden')
+        setStatus('Mengupload...')
+
+        function onProgress(loaded, total) {
+          if (!progressBar || !progressText) return
+          if (total && total > 0) {
+            const pct = Math.max(0, Math.min(100, Math.round((loaded / total) * 100)))
+            progressBar.style.width = `${pct}%`
+            progressText.textContent = `${pct}% • ${formatBytes(loaded)} / ${formatBytes(total)}`
+          } else {
+            progressBar.style.width = '100%'
+            progressText.textContent = `${formatBytes(loaded)} terkirim`
+          }
+        }
+
+        return await uploadWithProgress(`/api/projects/${projectId}/documents`, form, onProgress)
+      }
+
       if (fileEl && previewEl) {
+        let previewUrl = null
         fileEl.addEventListener('change', async () => {
+          if (previewUrl) {
+            try {
+              URL.revokeObjectURL(previewUrl)
+            } catch {}
+            previewUrl = null
+          }
           previewEl.classList.add('hidden')
           previewEl.innerHTML = ''
+          resetProgress()
+          showRetry(false)
+          setStatus('')
+          lastPreparedFile = null
           const f = fileEl.files && fileEl.files[0]
-          if (!f || !isImageFile(f)) return
-          const url = URL.createObjectURL(f)
-          previewEl.innerHTML = `<img src="${url}" class="max-h-56 w-full object-contain" />`
-          previewEl.classList.remove('hidden')
+          if (!f) return
+          if (isImageFile(f)) {
+            previewUrl = URL.createObjectURL(f)
+            previewEl.innerHTML = `<img alt="Preview" src="${previewUrl}" class="max-h-56 w-full object-contain" />`
+            previewEl.classList.remove('hidden')
+            try {
+              const { width, height } = await getImageResolution(f)
+              if (width > 2000 || height > 2000) {
+                setStatus('Gambar akan di-resize otomatis sebelum upload.')
+              }
+            } catch {}
+            return
+          }
+          if (!isPdfFile(f)) {
+            toast('Format tidak didukung. Gunakan PDF/JPEG/PNG/WEBP', 'error')
+          }
+          return
         })
       }
 
-      qs('#btn-upload').addEventListener('click', async () => {
-        const f = qs('#file').files[0]
-        const statusEl = qs('#upload-status')
+      async function handleUpload() {
+        const f = fileEl && fileEl.files && fileEl.files[0]
         if (!f) {
           toast('Pilih file dulu', 'error')
           return
         }
 
         if (!(isPdfFile(f) || isImageFile(f))) {
-          toast('Format tidak didukung. Gunakan PDF/JPG/JPEG/PNG/GIF/TIFF', 'error')
+          toast('Format tidak didukung. Gunakan PDF/JPEG/PNG/WEBP', 'error')
           return
         }
 
-        if (isImageFile(f)) {
-          const max = 5 * 1024 * 1024
-          if (f.size > max) {
-            toast('Ukuran file melebihi 5MB', 'error')
-            return
-          }
-          try {
-            const { width, height } = await getImageResolution(f)
-            if (width < 300 || height < 300) {
-              toast('Resolusi minimal 300x300 piksel', 'error')
-              return
-            }
-          } catch (e) {
-            toast(e.message, 'error')
-            return
-          }
+        const max = 5 * 1024 * 1024
+        if (isImageFile(f) && f.size > max) {
+          toast(`Ukuran file maksimum ${formatBytes(max)}`, 'error')
+          return
         }
 
-        statusEl.textContent = 'Uploading...'
-        const form = new FormData()
-        form.append('file', f)
+        if (uploading) return
+        setUploadingUi(true)
+        showRetry(false)
+        resetProgress()
+
         try {
-          await api(`/api/projects/${projectId}/documents`, { method: 'POST', body: form })
+          let toSend = f
+          if (isImageFile(f)) {
+            setStatus('Memproses gambar...')
+            const prep = await resizeImageFileIfNeeded(f, { maxDim: 2000, maxBytes: max })
+            toSend = prep.file
+            lastPreparedFile = toSend
+            if (prep.resized) {
+              setStatus(`Gambar di-resize ke ${prep.width}×${prep.height}. Mengupload...`)
+            }
+          }
+
+          await doUpload(toSend)
           toast('Upload berhasil', 'success')
-          statusEl.textContent = ''
+          setStatus('')
+          resetProgress()
+          showRetry(false)
+          setUploadingUi(false)
           render()
         } catch (e) {
-          statusEl.textContent = ''
-          toast(e.message, 'error')
+          setUploadingUi(false)
+          setStatus('')
+          resetProgress()
+          showRetry(!!(isImageFile(f) || isPdfFile(f)))
+          toast(e.message || 'Upload gagal', 'error')
         }
-      })
+      }
+
+      if (uploadBtn) {
+        uploadBtn.addEventListener('click', async () => {
+          await handleUpload()
+        })
+      }
+
+      if (retryBtn) {
+        retryBtn.addEventListener('click', async () => {
+          const f = fileEl && fileEl.files && fileEl.files[0]
+          if (!f) {
+            toast('Pilih file dulu', 'error')
+            return
+          }
+          if (uploading) return
+          try {
+            setUploadingUi(true)
+            showRetry(false)
+            let toSend = f
+            if (isImageFile(f)) {
+              toSend = lastPreparedFile || f
+            }
+            await doUpload(toSend)
+            toast('Upload berhasil', 'success')
+            setUploadingUi(false)
+            setStatus('')
+            resetProgress()
+            render()
+          } catch (e) {
+            setUploadingUi(false)
+            showRetry(true)
+            setStatus('')
+            resetProgress()
+            toast(e.message || 'Upload gagal', 'error')
+          }
+        })
+      }
       qsa('[data-del-doc]').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const id = btn.getAttribute('data-del-doc')
@@ -814,35 +1272,6 @@ async function render() {
       qsa('[data-extract]').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const id = btn.getAttribute('data-extract')
-          const kind = (btn.getAttribute('data-kind') || '').toLowerCase()
-          if (kind === 'image') {
-            const out = qs(`[data-doc-out="${id}"]`)
-            if (out) {
-              out.classList.add('hidden')
-              out.textContent = ''
-            }
-            try {
-              toast('Menjalankan OCR MTO...', 'info')
-              const res = await api(`/api/documents/${id}/mto`, { method: 'POST' })
-              const items = (res && res.items) || []
-              const outputs = (res && res.outputs) || {}
-              const txtUrl = outputs.txt && outputs.txt.download_url
-              const csvUrl = outputs.csv && outputs.csv.download_url
-              if (out) {
-                const links = []
-                if (txtUrl) links.push(`<a class="underline" target="_blank" href="${txtUrl}">Download TXT</a>`)
-                if (csvUrl) links.push(`<a class="underline" target="_blank" href="${csvUrl}">Download CSV</a>`)
-                out.innerHTML = `${links.length ? `<div class="mb-2 flex gap-3">${links.join('')}</div>` : ''}<pre class="whitespace-pre-wrap">${escapeHtml(
-                  JSON.stringify(items, null, 2)
-                )}</pre>`
-                out.classList.remove('hidden')
-              }
-              toast(`OCR MTO selesai: ${items.length} baris`, 'success')
-            } catch (e) {
-              toast(e.message, 'error')
-            }
-            return
-          }
           try {
             toast('Ekstraksi dimulai...', 'info')
             await api(`/api/documents/${id}/extract`, { method: 'POST' })
@@ -854,9 +1283,9 @@ async function render() {
         })
       })
 
-      qsa('[data-mto]').forEach((btn) => {
+      qsa('[data-mto-import]').forEach((btn) => {
         btn.addEventListener('click', async () => {
-          const id = btn.getAttribute('data-mto')
+          const id = btn.getAttribute('data-mto-import')
           if (!id) return
           const out = qs(`[data-doc-out="${id}"]`)
           if (out) {
@@ -864,22 +1293,20 @@ async function render() {
             out.textContent = ''
           }
           try {
-            toast('Menjalankan OCR MTO...', 'info')
-            const res = await api(`/api/documents/${id}/mto`, { method: 'POST' })
-            const items = (res && res.items) || []
-            const outputs = (res && res.outputs) || {}
-            const txtUrl = outputs.txt && outputs.txt.download_url
-            const csvUrl = outputs.csv && outputs.csv.download_url
+            toast('Menjalankan OCR MTO dan menyimpan ke Tampilan Data...', 'info')
+            const res = await api(`/api/documents/${id}/mto/import`, { method: 'POST' })
+            const inserted = (res && res.inserted_materials) || 0
+            const flagged = (res && res.flagged) || 0
+            const run = (res && res.ocr_run) || null
             if (out) {
-              const links = []
-              if (txtUrl) links.push(`<a class="underline" target="_blank" href="${txtUrl}">Download TXT</a>`)
-              if (csvUrl) links.push(`<a class="underline" target="_blank" href="${csvUrl}">Download CSV</a>`)
-              out.innerHTML = `${links.length ? `<div class="mb-2 flex gap-3">${links.join('')}</div>` : ''}<pre class="whitespace-pre-wrap">${escapeHtml(
-                JSON.stringify(items, null, 2)
-              )}</pre>`
+              out.innerHTML = `<div class="text-xs text-slate-300">OCR run: <span class="text-slate-100">${escapeHtml((run && run.id) || '-')}</span></div>` +
+                `<div class="mt-1 text-xs text-slate-400">Material OCR tersimpan: <span class="text-slate-200">${inserted}</span> • Flag review: <span class="text-slate-200">${flagged}</span></div>` +
+                `<div class="mt-2 text-xs text-slate-500">Gunakan filter dokumen pada tabel Material untuk melihat hasilnya.</div>`
               out.classList.remove('hidden')
             }
-            toast(`OCR MTO selesai: ${items.length} baris`, 'success')
+            qs('#mat-doc').value = id
+            qs('#btn-search').click()
+            toast(`OCR MTO selesai: ${inserted} baris tersimpan`, 'success')
           } catch (e) {
             toast(e.message, 'error')
           }

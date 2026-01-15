@@ -47,6 +47,7 @@ from .services.extraction import (
     parse_materials,
     parse_materials_from_pdf_bytes,
     validate_and_convert_image_upload,
+    _try_import_pytesseract,
 )
 
 
@@ -125,6 +126,102 @@ def _duplicate_email_http() -> HTTPException:
 
 def _storage_file_options(content_type: str) -> dict[str, str]:
     return {"content-type": content_type}
+
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def _insert_item_revision(
+    svc,
+    *,
+    owner_id: str,
+    project_id: str,
+    document_id: str | None,
+    material_id: str | None,
+    change_source: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+    changed_by: str | None,
+    ocr_run_id: str | None = None,
+    ocr_extraction_id: str | None = None,
+) -> None:
+    row = {
+        "id": str(uuid4()),
+        "owner_id": owner_id,
+        "project_id": project_id,
+        "document_id": document_id,
+        "material_id": material_id,
+        "change_source": change_source,
+        "before": before,
+        "after": after,
+        "ocr_run_id": ocr_run_id,
+        "ocr_extraction_id": ocr_extraction_id,
+        "changed_by": changed_by,
+        "changed_at": _utc_now_iso(),
+    }
+    svc.table("item_revisions").insert(row).execute()
+
+
+def _tesseract_engine_version() -> str | None:
+    p = _try_import_pytesseract()
+    if p is None:
+        return None
+    try:
+        return str(p.get_tesseract_version())
+    except Exception:
+        return None
+
+
+def _mto_row_to_material_fields(row: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    raw_desc = str(row.get("description") or "").strip()
+    raw_mat = str(row.get("material") or "").strip()
+    raw_nps = str(row.get("nps") or "").strip()
+    qty = row.get("qty_value")
+    unit = str(row.get("qty_unit") or "").strip()
+
+    name = raw_desc or raw_mat
+    spec_parts: list[str] = []
+    if raw_mat and raw_mat != name:
+        spec_parts.append(raw_mat)
+
+    if "," in raw_desc:
+        head, tail = raw_desc.split(",", 1)
+        head = head.strip()
+        tail = tail.strip()
+        if head:
+            name = head
+        if tail:
+            spec_parts.append(tail)
+
+    spec = "\n".join([p for p in spec_parts if p]).strip() or None
+
+    size = raw_nps or None
+    if size and size.isdigit():
+        size = f"{size} Inch"
+
+    out = {
+        "description": name or "",
+        "spec": spec,
+        "size": size,
+        "quantity": float(qty) if qty is not None else None,
+        "unit": unit or None,
+    }
+
+    flags: list[str] = []
+    if not out["description"]:
+        flags.append("missing_description")
+    if out["quantity"] is None:
+        flags.append("missing_quantity")
+    if out["unit"] is None:
+        flags.append("missing_unit")
+    if out["size"] is None:
+        flags.append("missing_size")
+    if out["unit"] is not None and len(out["unit"]) > 8:
+        flags.append("unit_suspicious")
+    if out["unit"] is not None and out["size"] is not None and "inch" in str(out["size"]).lower() and str(out["unit"]).lower() in ["mm", "cm"]:
+        flags.append("unit_size_mismatch")
+    return out, flags
 
 
 def _ensure_storage_bucket(svc) -> None:
@@ -367,12 +464,12 @@ def create_project(payload: ProjectCreate, user_id: str = Depends(_require_auth)
 @app.get("/api/projects/{project_id}", response_model=Project)
 def get_project(project_id: str, user_id: str = Depends(_require_auth)):
     svc = get_supabase_service()
-    res = svc.table("projects").select("*").eq("id", project_id).eq("owner_id", user_id).maybe_single().execute()
+    res = svc.table("projects").select("*").eq("id", project_id).eq("owner_id", user_id).limit(1).execute()
     if res is None:
         raise HTTPException(status_code=500, detail="Gagal mengambil proyek")
     if not res.data:
         raise HTTPException(status_code=404, detail="Proyek tidak ditemukan")
-    return res.data
+    return res.data[0]
 
 
 @app.patch("/api/projects/{project_id}", response_model=Project)
@@ -440,7 +537,7 @@ async def upload_document(project_id: str, file: UploadFile = File(...), user_id
     filename_in = file.filename or ""
 
     svc = get_supabase_service()
-    pr = svc.table("projects").select("id").eq("id", project_id).eq("owner_id", user_id).maybe_single().execute()
+    pr = svc.table("projects").select("id").eq("id", project_id).eq("owner_id", user_id).limit(1).execute()
     if pr is None:
         raise HTTPException(status_code=500, detail="Gagal mengambil proyek")
     if not pr.data:
@@ -469,20 +566,21 @@ async def upload_document(project_id: str, file: UploadFile = File(...), user_id
 
     if kind == "image":
         try:
-            png_bytes, w, h, out_mime = validate_and_convert_image_upload(
+            out_bytes, w, h, out_mime, out_ext = validate_and_convert_image_upload(
                 content,
                 filename=original_filename or "upload.png",
                 content_type=content_type_in,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        content = png_bytes
+        content = out_bytes
         mime_type = out_mime
         file_kind = "image"
         image_w = w
         image_h = h
         file_size_bytes = len(content)
-        filename = f"{doc_id}.png"
+        ext_out = out_ext if out_ext and out_ext.startswith(".") else ".png"
+        filename = f"{doc_id}{ext_out}"
         storage_path = f"{user_id}/{project_id}/images/{filename}"
     else:
         pdf_name = os.path.basename(filename_in) if filename_in else f"{doc_id}.pdf"
@@ -539,12 +637,12 @@ async def upload_document(project_id: str, file: UploadFile = File(...), user_id
 @app.delete("/api/documents/{document_id}")
 def delete_document(document_id: str, user_id: str = Depends(_require_auth)):
     svc = get_supabase_service()
-    doc = svc.table("documents").select("*").eq("id", document_id).eq("owner_id", user_id).maybe_single().execute()
+    doc = svc.table("documents").select("*").eq("id", document_id).eq("owner_id", user_id).limit(1).execute()
     if doc is None:
         raise HTTPException(status_code=500, detail="Gagal mengambil dokumen")
     if not doc.data:
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
-    storage_path = doc.data["storage_path"]
+    storage_path = doc.data[0]["storage_path"]
 
     _ensure_storage_bucket(svc)
     storage = svc.storage.from_(settings.supabase_bucket)
@@ -671,6 +769,13 @@ def create_material(project_id: str, payload: MaterialCreate, user_id: str = Dep
 @app.patch("/api/materials/{material_id}", response_model=Material)
 def update_material(material_id: str, payload: MaterialUpdate, user_id: str = Depends(_require_auth)):
     svc = get_supabase_service()
+    existing = svc.table("materials").select("*").eq("id", material_id).eq("owner_id", user_id).limit(1).execute()
+    if existing is None:
+        raise HTTPException(status_code=500, detail="Gagal mengambil material")
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Material tidak ditemukan")
+
+    before = dict(existing.data[0])
     patch = payload.model_dump(exclude_none=True)
     if not patch:
         raise HTTPException(status_code=400, detail="Tidak ada perubahan")
@@ -679,7 +784,138 @@ def update_material(material_id: str, payload: MaterialUpdate, user_id: str = De
         raise HTTPException(status_code=500, detail="Gagal update material")
     if not res.data:
         raise HTTPException(status_code=404, detail="Material tidak ditemukan")
+
+    try:
+        after = dict(res.data[0])
+        _insert_item_revision(
+            svc,
+            owner_id=user_id,
+            project_id=str(after.get("project_id") or before.get("project_id") or ""),
+            document_id=str(after.get("document_id") or before.get("document_id") or "") or None,
+            material_id=material_id,
+            change_source="manual_edit",
+            before={k: before.get(k) for k in ["description", "spec", "size", "quantity", "unit", "verification_status", "needs_review"]},
+            after={k: after.get(k) for k in ["description", "spec", "size", "quantity", "unit", "verification_status", "needs_review"]},
+            changed_by=user_id,
+            ocr_run_id=str(after.get("ocr_run_id") or "") or None,
+            ocr_extraction_id=str(after.get("ocr_extraction_id") or "") or None,
+        )
+    except Exception:
+        pass
     return res.data[0]
+
+
+@app.get("/api/materials/{material_id}/history")
+def material_history(material_id: str, user_id: str = Depends(_require_auth)):
+    svc = get_supabase_service()
+    m = svc.table("materials").select("project_id", "document_id").eq("id", material_id).eq("owner_id", user_id).limit(1).execute()
+    if m is None or not m.data:
+        raise HTTPException(status_code=404, detail="Material tidak ditemukan")
+    res = (
+        svc.table("item_revisions")
+        .select("*")
+        .eq("material_id", material_id)
+        .eq("owner_id", user_id)
+        .order("changed_at", desc=True)
+        .limit(50)
+        .execute()
+    )
+    return res.data or []
+
+
+@app.get("/api/materials/{material_id}/ocr-context")
+def material_ocr_context(material_id: str, user_id: str = Depends(_require_auth)):
+    svc = get_supabase_service()
+    m = svc.table("materials").select("*").eq("id", material_id).eq("owner_id", user_id).limit(1).execute()
+    if m is None or not m.data:
+        raise HTTPException(status_code=404, detail="Material tidak ditemukan")
+    mat = m.data[0]
+
+    run = None
+    ext = None
+    run_id = str(mat.get("ocr_run_id") or "")
+    ext_id = str(mat.get("ocr_extraction_id") or "")
+
+    if run_id:
+        r = svc.table("ocr_runs").select("*").eq("id", run_id).eq("owner_id", user_id).limit(1).execute()
+        run = (r.data[0] if (r is not None and r.data) else None)
+    if ext_id:
+        e = svc.table("ocr_item_extractions").select("*").eq("id", ext_id).eq("owner_id", user_id).limit(1).execute()
+        ext = (e.data[0] if (e is not None and e.data) else None)
+    return {"material": mat, "ocr_run": run, "ocr_extraction": ext}
+
+
+@app.post("/api/materials/{material_id}/review")
+async def review_material(material_id: str, request: Request, user_id: str = Depends(_require_auth)):
+    svc = get_supabase_service()
+    body = await request.json()
+    decision = str((body or {}).get("decision") or "").strip().lower()
+    notes = (body or {}).get("notes")
+    patch_in = (body or {}).get("patch") or {}
+
+    if decision not in ("approved", "rejected"):
+        raise HTTPException(status_code=400, detail="decision harus approved atau rejected")
+
+    existing = svc.table("materials").select("*").eq("id", material_id).eq("owner_id", user_id).limit(1).execute()
+    if existing is None or not existing.data:
+        raise HTTPException(status_code=404, detail="Material tidak ditemukan")
+    before = dict(existing.data[0])
+
+    now = _utc_now_iso()
+    patch: dict[str, Any] = {}
+    for k in ["description", "spec", "size", "quantity", "unit"]:
+        if k in patch_in:
+            patch[k] = patch_in.get(k)
+
+    if decision == "approved":
+        patch["verification_status"] = "approved"
+        patch["needs_review"] = False
+        patch["verified_by"] = user_id
+        patch["verified_at"] = now
+    else:
+        patch["verification_status"] = "rejected"
+        patch["needs_review"] = False
+        patch["verified_by"] = user_id
+        patch["verified_at"] = now
+
+    res = svc.table("materials").update(patch).eq("id", material_id).eq("owner_id", user_id).execute()
+    if res is None or not res.data:
+        raise HTTPException(status_code=500, detail="Gagal menyimpan review")
+    after = dict(res.data[0])
+
+    svc.table("review_decisions").insert(
+        {
+            "id": str(uuid4()),
+            "owner_id": user_id,
+            "project_id": after.get("project_id"),
+            "document_id": after.get("document_id"),
+            "material_id": material_id,
+            "ocr_extraction_id": after.get("ocr_extraction_id"),
+            "decision": decision,
+            "notes": notes,
+            "decided_by": user_id,
+            "decided_at": now,
+        }
+    ).execute()
+
+    try:
+        _insert_item_revision(
+            svc,
+            owner_id=user_id,
+            project_id=str(after.get("project_id") or ""),
+            document_id=str(after.get("document_id") or "") or None,
+            material_id=material_id,
+            change_source="ocr_verify" if decision == "approved" else "ocr_reject",
+            before={k: before.get(k) for k in ["description", "spec", "size", "quantity", "unit", "verification_status", "needs_review"]},
+            after={k: after.get(k) for k in ["description", "spec", "size", "quantity", "unit", "verification_status", "needs_review"]},
+            changed_by=user_id,
+            ocr_run_id=str(after.get("ocr_run_id") or "") or None,
+            ocr_extraction_id=str(after.get("ocr_extraction_id") or "") or None,
+        )
+    except Exception:
+        pass
+
+    return after
 
 
 @app.delete("/api/materials/{material_id}")
@@ -694,12 +930,12 @@ def delete_material(material_id: str, user_id: str = Depends(_require_auth)):
 @app.get("/api/documents/{document_id}")
 def get_document(document_id: str, user_id: str = Depends(_require_auth)):
     svc = get_supabase_service()
-    doc = svc.table("documents").select("*").eq("id", document_id).eq("owner_id", user_id).maybe_single().execute()
+    doc = svc.table("documents").select("*").eq("id", document_id).eq("owner_id", user_id).limit(1).execute()
     if doc is None:
         raise HTTPException(status_code=500, detail="Gagal mengambil dokumen")
     if not doc.data:
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
-    return doc.data
+    return doc.data[0]
 
 
 @app.get("/api/documents/{document_id}/extraction-runs")
@@ -721,13 +957,13 @@ def list_extraction_runs(document_id: str, user_id: str = Depends(_require_auth)
 @app.post("/api/documents/{document_id}/extract", response_model=ExtractionResponse)
 async def extract_document(document_id: str, user_id: str = Depends(_require_auth)):
     svc = get_supabase_service()
-    doc = svc.table("documents").select("*").eq("id", document_id).eq("owner_id", user_id).maybe_single().execute()
+    doc = svc.table("documents").select("*").eq("id", document_id).eq("owner_id", user_id).limit(1).execute()
     if doc is None:
         raise HTTPException(status_code=500, detail="Gagal mengambil dokumen")
     if not doc.data:
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
 
-    d = doc.data
+    d = doc.data[0]
 
     inferred_kind = (str(d.get("file_kind") or "").strip().lower() or None)
     if inferred_kind is None:
@@ -782,38 +1018,49 @@ async def extract_document(document_id: str, user_id: str = Depends(_require_aut
 
     svc.table("documents").update({"status": "extracting"}).eq("id", document_id).eq("owner_id", user_id).execute()
 
-    text = extract_pdf_text(file_bytes)
     method = "pdf_text"
-    notes = None
-
-    if len(text.strip()) < 200:
-        ocr_text, ocr_note = ocr_pdf_text(file_bytes)
-        if ocr_text.strip():
-            text = ocr_text
-            method = "pdf_text_then_ocr"
-            notes = ocr_note
-        else:
-            method = "pdf_text_then_ocr"
-            notes = ocr_note or "OCR tidak menghasilkan teks"
-
-    extracted_json = build_extracted_json(text, method=method, notes=notes)
-    info = parse_doc_info(text)
-
-    svc.table("documents").update(
-        {
-            "document_type": info.document_type,
-            "document_number": info.document_number,
-            "status": "success" if len(text.strip()) >= 10 else "failed",
-        }
-    ).eq("id", document_id).eq("owner_id", user_id).execute()
-
+    notes: str | None = None
+    text = ""
     inserted = 0
-    if len(text.strip()) >= 10:
-        mats, parse_warnings = parse_materials_from_pdf_bytes(file_bytes, max_rows=5000)
-        parser_used = "pdf_words_table" if mats else "text_lines"
+    extracted_json: dict[str, Any] = {}
+
+    try:
+        text = extract_pdf_text(file_bytes)
+        if len(text.strip()) < 200:
+            try:
+                ocr_text, ocr_note = ocr_pdf_text(file_bytes)
+            except Exception as e:
+                logger.exception("ocr_pdf_text_failed: doc=%s", document_id)
+                ocr_text, ocr_note = "", f"OCR error: {e}"
+
+            if ocr_text.strip():
+                text = ocr_text
+                method = "pdf_text_then_ocr"
+                notes = ocr_note
+            else:
+                method = "pdf_text_then_ocr"
+                notes = ocr_note or "OCR tidak menghasilkan teks"
+
+        extracted_json = build_extracted_json(text, method=method, notes=notes)
+        info = parse_doc_info(text)
+
+        mats: list[dict[str, Any]] = []
+        parse_warnings: list[str] = []
+        parser_used = "pdf_words_table"
+        try:
+            mats, parse_warnings = parse_materials_from_pdf_bytes(file_bytes, max_rows=5000)
+        except Exception as e:
+            logger.exception("parse_materials_from_pdf_bytes_failed: doc=%s", document_id)
+            parse_warnings = [f"parse_materials_from_pdf_bytes error: {e}"]
+            mats = []
+
         if not mats:
-            mats = parse_materials(text, max_rows=5000)
-            parse_warnings = []
+            parser_used = "text_lines"
+            if len(text.strip()) >= 10:
+                mats = parse_materials(text, max_rows=5000)
+                parse_warnings = []
+
+        success = len(text.strip()) >= 10 or bool(mats)
 
         if parse_warnings:
             extra_notes = "\n".join(parse_warnings[:50])
@@ -823,6 +1070,14 @@ async def extract_document(document_id: str, user_id: str = Depends(_require_aut
         extracted_json["materials_parser"] = parser_used
         if parse_warnings:
             extracted_json["warnings"] = parse_warnings[:50]
+
+        svc.table("documents").update(
+            {
+                "document_type": info.document_type,
+                "document_number": info.document_number,
+                "status": "success" if success else "failed",
+            }
+        ).eq("id", document_id).eq("owner_id", user_id).execute()
 
         if mats:
             svc.table("materials").delete().eq("document_id", document_id).eq("owner_id", user_id).execute()
@@ -849,24 +1104,62 @@ async def extract_document(document_id: str, user_id: str = Depends(_require_aut
                 raise HTTPException(status_code=500, detail="Gagal menyimpan material")
             inserted = len(ins.data or [])
 
-    run_id = str(uuid4())
-    run_row = {
-        "id": run_id,
-        "owner_id": user_id,
-        "document_id": document_id,
-        "method": method,
-        "status": "success" if len(text.strip()) >= 10 else "failed",
-        "extracted_json": extracted_json,
-        "notes": notes,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-    svc.table("extraction_runs").insert(run_row).execute()
+        run_id = str(uuid4())
+        run_row = {
+            "id": run_id,
+            "owner_id": user_id,
+            "document_id": document_id,
+            "method": method,
+            "status": "success" if success else "failed",
+            "extracted_json": extracted_json,
+            "notes": notes,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        svc.table("extraction_runs").insert(run_row).execute()
 
-    run_res = svc.table("extraction_runs").select("*").eq("id", run_id).maybe_single().execute()
-    if run_res is None:
-        raise HTTPException(status_code=500, detail="Gagal mengambil hasil ekstraksi")
-    run = run_res.data
-    return {"run": run, "inserted_materials": inserted}
+        run_res = svc.table("extraction_runs").select("*").eq("id", run_id).eq("owner_id", user_id).limit(1).execute()
+        if run_res is None:
+            raise HTTPException(status_code=500, detail="Gagal mengambil hasil ekstraksi")
+        run = (run_res.data or [None])[0]
+        return {"run": run, "inserted_materials": inserted}
+    except HTTPException as e:
+        logger.exception("extract_failed: doc=%s", document_id)
+        try:
+            svc.table("documents").update({"status": "failed"}).eq("id", document_id).eq("owner_id", user_id).execute()
+            svc.table("extraction_runs").insert(
+                {
+                    "id": str(uuid4()),
+                    "owner_id": user_id,
+                    "document_id": document_id,
+                    "method": method,
+                    "status": "failed",
+                    "extracted_json": extracted_json or None,
+                    "notes": str(e.detail),
+                    "created_at": datetime.utcnow().isoformat(),
+                }
+            ).execute()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        logger.exception("extract_failed: doc=%s", document_id)
+        try:
+            svc.table("documents").update({"status": "failed"}).eq("id", document_id).eq("owner_id", user_id).execute()
+            svc.table("extraction_runs").insert(
+                {
+                    "id": str(uuid4()),
+                    "owner_id": user_id,
+                    "document_id": document_id,
+                    "method": method,
+                    "status": "failed",
+                    "extracted_json": extracted_json or None,
+                    "notes": str(e),
+                    "created_at": datetime.utcnow().isoformat(),
+                }
+            ).execute()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Ekstraksi gagal: {e}")
 
 
 def _parse_bbox(bbox: str | None) -> tuple[float, float, float, float] | None:
@@ -899,6 +1192,11 @@ async def _download_document_bytes(svc, storage_path: str) -> bytes:
         r = httpx.get(url, timeout=60.0)
         r.raise_for_status()
         return r.content
+    except httpx.HTTPStatusError as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 404:
+            raise HTTPException(status_code=404, detail="File tidak ditemukan di storage (404)")
+        raise HTTPException(status_code=400, detail=f"Gagal download file: HTTP {status}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Gagal download file: {e}")
 
@@ -932,22 +1230,56 @@ def _upload_output_bytes(
 
 
 def _require_doc_owner(svc, document_id: str, user_id: str) -> dict[str, Any]:
-    doc = svc.table("documents").select("*").eq("id", document_id).eq("owner_id", user_id).maybe_single().execute()
+    doc = svc.table("documents").select("*").eq("id", document_id).eq("owner_id", user_id).limit(1).execute()
     if doc is None:
         raise HTTPException(status_code=500, detail="Gagal mengambil dokumen")
     if not doc.data:
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
-    return doc.data
+    return doc.data[0]
+
+
+def _parse_bool_param(v: Any) -> bool | None:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return None
+
+
+async def _get_params_query_or_form(request: Request) -> dict[str, str]:
+    qp: dict[str, str] = {k: v for k, v in request.query_params.items()}
+    ct = (request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in ct or "application/x-www-form-urlencoded" in ct:
+        try:
+            form = await request.form()
+            for k, v in form.items():
+                if k not in qp:
+                    if hasattr(v, "filename"):
+                        continue
+                    qp[k] = str(v)
+        except Exception:
+            pass
+    return qp
 
 
 @app.post("/api/documents/{document_id}/mto")
 async def extract_mto_from_document(
     document_id: str,
-    page_index: int = 0,
-    bbox: str | None = None,
-    split_columns: bool | None = None,
+    request: Request,
     user_id: str = Depends(_require_auth),
 ):
+    params = await _get_params_query_or_form(request)
+    try:
+        page_index = int(params.get("page_index") or 0)
+    except Exception:
+        raise HTTPException(status_code=400, detail="page_index harus berupa integer")
+    bbox = cast(str | None, params.get("bbox"))
+    split_columns = _parse_bool_param(params.get("split_columns"))
     svc = get_supabase_service()
     d = _require_doc_owner(svc, document_id, user_id)
     file_kind = (str(d.get("file_kind") or "").strip().lower() or "pdf")
@@ -957,7 +1289,7 @@ async def extract_mto_from_document(
 
     raw = await _download_document_bytes(svc, storage_path)
 
-    logger.info("mto_extract: doc=%s kind=%s", document_id, file_kind)
+    logger.info("mto_extract: doc=%s kind=%s page_index=%s", document_id, file_kind, page_index)
 
     try:
         kind = detect_upload_kind(raw, filename=str(d.get("filename") or ""), content_type=str(d.get("mime_type") or "") or None)
@@ -977,6 +1309,7 @@ async def extract_mto_from_document(
                         "atau set env TESSERACT_CMD. Setelah itu ulangi OCR MTO. Jika perlu, gunakan opsi konversi gambar ke PDF."
                     ),
                 )
+            logger.exception("mto_extract_failed: doc=%s", document_id)
             raise HTTPException(status_code=400, detail=f"OCR MTO gagal: {e}")
 
         proj_id = str(d.get("project_id") or "")
@@ -1032,8 +1365,9 @@ async def extract_mto_from_document(
     try:
         rows = extract_mto_from_pdf_bytes_advanced(raw, int(page_index), bbox=_parse_bbox(bbox), split_columns=split_columns)
     except Exception as e:
+        logger.exception("mto_extract_failed: doc=%s", document_id)
         raise HTTPException(status_code=400, detail=f"OCR MTO gagal: {e}")
-
+    
     proj_id = str(d.get("project_id") or "")
     txt_lines = ["item\tmaterial\tdescription\tnps\tqty_value\tqty_unit\tsource"]
     for r in rows:
@@ -1085,21 +1419,174 @@ async def extract_mto_from_document(
     return {"items": rows, "outputs": {"txt": out_txt, "csv": out_csv}}
 
 
-@app.post("/api/documents/{document_id}/mto/csv")
-async def extract_mto_from_document_csv(
-    document_id: str,
-    page_index: int = 0,
-    bbox: str | None = None,
-    split_columns: bool | None = None,
-    user_id: str = Depends(_require_auth),
-):
-    payload = await extract_mto_from_document(
-        document_id,
-        page_index=int(page_index),
-        bbox=bbox,
-        split_columns=split_columns,
-        user_id=user_id,
+@app.post("/api/documents/{document_id}/mto/import")
+async def import_mto_ocr(document_id: str, request: Request, user_id: str = Depends(_require_auth)):
+    params = await _get_params_query_or_form(request)
+    try:
+        page_index = int(params.get("page_index") or 0)
+    except Exception:
+        raise HTTPException(status_code=400, detail="page_index harus berupa integer")
+    bbox = cast(str | None, params.get("bbox"))
+    split_columns = _parse_bool_param(params.get("split_columns"))
+
+    svc = get_supabase_service()
+    d = _require_doc_owner(svc, document_id, user_id)
+    storage_path = str(d.get("storage_path") or "")
+    if not storage_path:
+        raise HTTPException(status_code=400, detail="storage_path kosong")
+    raw = await _download_document_bytes(svc, storage_path)
+
+    file_kind = (str(d.get("file_kind") or "").strip().lower() or "pdf")
+    try:
+        kind = detect_upload_kind(raw, filename=str(d.get("filename") or ""), content_type=str(d.get("mime_type") or "") or None)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        if file_kind == "image" or kind == "image":
+            rows = extract_mto_from_image_bytes_advanced(raw, bbox=_parse_bbox(bbox), split_columns=split_columns)
+        else:
+            rows = extract_mto_from_pdf_bytes_advanced(raw, int(page_index), bbox=_parse_bbox(bbox), split_columns=split_columns)
+    except Exception as e:
+        msg = str(e)
+        if "Tesseract OCR tidak terdeteksi" in msg or "pytesseract tidak tersedia" in msg:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "OCR belum tersedia di server. Install Tesseract OCR di Windows dan pastikan tesseract.exe ada di PATH, "
+                    "atau set env TESSERACT_CMD. Setelah itu ulangi OCR MTO."
+                ),
+            )
+        logger.exception("mto_import_failed: doc=%s", document_id)
+        raise HTTPException(status_code=400, detail=f"OCR MTO gagal: {e}")
+
+    run_id = str(uuid4())
+    now = _utc_now_iso()
+    engine_version = _tesseract_engine_version()
+    run_row = {
+        "id": run_id,
+        "owner_id": user_id,
+        "project_id": d.get("project_id"),
+        "document_id": document_id,
+        "engine_name": "tesseract",
+        "engine_version": engine_version,
+        "processed_at": now,
+        "input_file_kind": file_kind,
+        "input_filename": d.get("filename"),
+        "input_storage_path": d.get("storage_path"),
+        "created_at": now,
+    }
+    svc.table("ocr_runs").insert(run_row).execute()
+    svc.table("documents").update({"last_ocr_run_id": run_id, "last_ocr_processed_at": now}).eq("id", document_id).eq("owner_id", user_id).execute()
+
+    try:
+        svc.table("materials").delete().eq("document_id", document_id).eq("owner_id", user_id).eq("data_source", "ocr").execute()
+    except Exception:
+        pass
+
+    extractions: list[dict[str, Any]] = []
+    mats_to_insert: list[dict[str, Any]] = []
+    flagged = 0
+    for r in rows:
+        norm, flags = _mto_row_to_material_fields(r)
+        needs_review = len(flags) > 0
+        if needs_review:
+            flagged += 1
+        extraction_id = str(uuid4())
+        extractions.append(
+            {
+                "id": extraction_id,
+                "owner_id": user_id,
+                "project_id": d.get("project_id"),
+                "document_id": document_id,
+                "ocr_run_id": run_id,
+                "page_index": int(page_index),
+                "line_no": int(r.get("item") or 0) if str(r.get("item") or "").isdigit() else None,
+                "raw_payload": r,
+                "normalized_fields": norm,
+                "confidence": None,
+                "flags": {"flags": flags, "needs_review": needs_review},
+                "created_at": now,
+            }
+        )
+
+        mats_to_insert.append(
+            {
+                "id": str(uuid4()),
+                "owner_id": user_id,
+                "project_id": d.get("project_id"),
+                "document_id": document_id,
+                "description": norm.get("description") or "",
+                "spec": norm.get("spec"),
+                "size": norm.get("size"),
+                "quantity": norm.get("quantity"),
+                "unit": norm.get("unit"),
+                "heat_no": None,
+                "tag_no": None,
+                "created_at": now,
+                "data_source": "ocr",
+                "verification_status": "needs_review" if needs_review else "draft",
+                "needs_review": needs_review,
+                "ocr_run_id": run_id,
+                "ocr_extraction_id": extraction_id,
+            }
+        )
+
+    if extractions:
+        svc.table("ocr_item_extractions").insert(extractions).execute()
+    inserted = 0
+    if mats_to_insert:
+        ins = svc.table("materials").insert(mats_to_insert).execute()
+        inserted = len(ins.data or [])
+
+    return {
+        "ocr_run": run_row,
+        "items": rows,
+        "inserted_materials": inserted,
+        "flagged": flagged,
+    }
+
+
+@app.get("/api/documents/{document_id}/mto/ocr-latest")
+def get_latest_mto_ocr(document_id: str, user_id: str = Depends(_require_auth)):
+    svc = get_supabase_service()
+    run_res = (
+        svc.table("ocr_runs")
+        .select("*")
+        .eq("document_id", document_id)
+        .eq("owner_id", user_id)
+        .order("processed_at", desc=True)
+        .limit(1)
+        .execute()
     )
+    runs = run_res.data or []
+    if not runs:
+        return {"ocr_run": None, "items": [], "materials": []}
+    run = runs[0]
+    run_id = run["id"]
+    exts = (
+        svc.table("ocr_item_extractions")
+        .select("*")
+        .eq("ocr_run_id", run_id)
+        .eq("owner_id", user_id)
+        .order("line_no", desc=False)
+        .execute()
+    ).data or []
+    mats = (
+        svc.table("materials")
+        .select("*")
+        .eq("ocr_run_id", run_id)
+        .eq("owner_id", user_id)
+        .order("created_at", desc=False)
+        .execute()
+    ).data or []
+    items = [e.get("raw_payload") for e in exts if e.get("raw_payload")]
+    return {"ocr_run": run, "items": items, "materials": mats, "extractions": exts}
+
+
+@app.post("/api/documents/{document_id}/mto/csv")
+async def extract_mto_from_document_csv(document_id: str, request: Request, user_id: str = Depends(_require_auth)):
+    payload = await extract_mto_from_document(document_id, request, user_id=user_id)
     rows = (payload or {}).get("items") or []
 
     buf = io.StringIO()

@@ -89,6 +89,8 @@ class Document(BaseModel):
     image_height: int | None = None
     original_filename: str | None = None
     download_url: str | None = None
+    last_ocr_run_id: str | None = None
+    last_ocr_processed_at: datetime | None = None
 
 
 class MaterialCreate(BaseModel):
@@ -110,6 +112,9 @@ class MaterialUpdate(BaseModel):
     heat_no: str | None = None
     tag_no: str | None = None
     spec: str | None = None
+    data_source: str | None = None
+    verification_status: str | None = None
+    needs_review: bool | None = None
 
 
 class Material(BaseModel):
@@ -125,6 +130,13 @@ class Material(BaseModel):
     tag_no: str | None
     spec: str | None
     created_at: datetime
+    data_source: str | None = None
+    verification_status: str | None = None
+    needs_review: bool | None = None
+    ocr_run_id: str | None = None
+    ocr_extraction_id: str | None = None
+    verified_by: str | None = None
+    verified_at: datetime | None = None
 
 
 class MaterialListResponse(BaseModel):

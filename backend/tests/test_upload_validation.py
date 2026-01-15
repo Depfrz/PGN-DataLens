@@ -16,16 +16,19 @@ class UploadValidationTests(unittest.TestCase):
         img.save(buf, format="PNG")
         return buf.getvalue()
 
-    def _tiff_bytes(self, w: int = 400, h: int = 400) -> bytes:
-        img = Image.new("RGB", (w, h), color=(100, 110, 120))
-        buf = io.BytesIO()
-        img.save(buf, format="TIFF")
-        return buf.getvalue()
-
     def _gif_bytes(self, w: int = 400, h: int = 400) -> bytes:
         img = Image.new("RGB", (w, h), color=(100, 110, 120))
         buf = io.BytesIO()
         img.save(buf, format="GIF")
+        return buf.getvalue()
+
+    def _webp_bytes(self, w: int = 400, h: int = 400) -> bytes | None:
+        img = Image.new("RGB", (w, h), color=(100, 110, 120))
+        buf = io.BytesIO()
+        try:
+            img.save(buf, format="WEBP", quality=85)
+        except Exception:
+            return None
         return buf.getvalue()
 
     def test_pdf_ok(self):
@@ -56,13 +59,16 @@ class UploadValidationTests(unittest.TestCase):
         k = detect_upload_kind(self._png_bytes(), filename="upload", content_type="image/png")
         self.assertEqual(k, "image")
 
-    def test_tiff_detected_as_image(self):
-        k = detect_upload_kind(self._tiff_bytes(), filename="a.tiff", content_type="image/tiff")
+    def test_webp_detected_as_image_when_supported(self):
+        raw = self._webp_bytes()
+        if raw is None:
+            self.skipTest("WEBP tidak didukung oleh Pillow pada environment ini")
+        k = detect_upload_kind(raw, filename="a.webp", content_type="image/webp")
         self.assertEqual(k, "image")
 
-    def test_gif_detected_as_image(self):
-        k = detect_upload_kind(self._gif_bytes(), filename="a.gif", content_type="image/gif")
-        self.assertEqual(k, "image")
+    def test_gif_rejected(self):
+        with self.assertRaises(ValueError):
+            detect_upload_kind(self._gif_bytes(), filename="a.gif", content_type="image/gif")
 
     def test_convert_image_to_pdf_returns_pdf_signature(self):
         pdf = convert_image_bytes_to_pdf(self._png_bytes())

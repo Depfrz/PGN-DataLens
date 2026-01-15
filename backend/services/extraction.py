@@ -4,15 +4,28 @@ import io
 import os
 import re
 import logging
+import shutil
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
+import importlib
 
-import fitz
+try:
+    _fitz = importlib.import_module("fitz")
+except Exception:
+    _fitz = None
+
+fitz: Any = _fitz
 from PIL import Image, ImageOps
 
 
-_ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".tif", ".tiff"}
-_ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/tiff"}
+def _require_fitz() -> Any:
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) tidak tersedia")
+    return fitz
+
+
+_ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+_ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp"}
 _ALLOWED_PDF_EXTS = {".pdf"}
 _ALLOWED_PDF_MIMES = {"application/pdf"}
 
@@ -49,7 +62,7 @@ def detect_upload_kind(
 
     pdf_sig = _is_pdf_bytes(file_bytes)
     img_fmt, _, _ = _detect_image_format(file_bytes)
-    img_ok = img_fmt in {"PNG", "JPEG", "GIF", "TIFF"}
+    img_ok = img_fmt in {"PNG", "JPEG", "WEBP"}
 
     if ext in _ALLOWED_PDF_EXTS:
         if pdf_sig:
@@ -59,7 +72,7 @@ def detect_upload_kind(
     if ext in _ALLOWED_IMAGE_EXTS:
         if img_ok:
             return "image"
-        raise ValueError("File berekstensi gambar tetapi kontennya bukan JPEG/PNG/GIF/TIFF")
+        raise ValueError("File berekstensi gambar tetapi kontennya bukan JPEG/PNG/WEBP")
 
     if ext == "":
         if pdf_sig:
@@ -69,14 +82,14 @@ def detect_upload_kind(
         if ct in _ALLOWED_PDF_MIMES:
             raise ValueError("MIME type application/pdf tetapi konten tidak terdeteksi sebagai PDF")
         if ct in _ALLOWED_IMAGE_MIMES:
-            raise ValueError("MIME type gambar tetapi konten tidak terdeteksi sebagai JPEG/PNG/GIF/TIFF")
+            raise ValueError("MIME type gambar tetapi konten tidak terdeteksi sebagai JPEG/PNG/WEBP")
         raise ValueError("File tanpa ekstensi dan tipe file tidak dapat dideteksi")
 
     if pdf_sig:
         raise ValueError("Ekstensi file tidak sesuai: konten PDF tetapi ekstensi bukan .pdf")
     if img_ok:
-        raise ValueError("Ekstensi file tidak sesuai: konten gambar tetapi ekstensi bukan .jpg/.jpeg/.png/.gif/.tif/.tiff")
-    raise ValueError("Format tidak didukung. Gunakan PDF/JPG/JPEG/PNG/GIF/TIFF")
+        raise ValueError("Ekstensi file tidak sesuai: konten gambar tetapi ekstensi bukan .jpg/.jpeg/.png/.webp")
+    raise ValueError("Format tidak didukung. Gunakan PDF/JPG/JPEG/PNG/WEBP")
 
 
 class _MuPDFPage(Protocol):
@@ -308,6 +321,7 @@ def parse_materials_from_pdf_bytes(file_bytes: bytes, max_rows: int = 5000) -> t
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
 
+    _require_fitz()
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     for page_index in range(len(doc)):
         if len(rows) >= max_rows:
@@ -537,6 +551,8 @@ def _parse_right_anchored_row_line(line: str) -> dict[str, Any] | None:
 
 
 def extract_pdf_text(file_bytes: bytes) -> str:
+    if fitz is None:
+        return ""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     parts: list[str] = []
     for page in doc:
@@ -548,11 +564,22 @@ def extract_pdf_text(file_bytes: bytes) -> str:
 
 def _try_import_pytesseract():
     try:
-        import pytesseract
+        pytesseract = importlib.import_module("pytesseract")
     except Exception:
         return None
 
     cmd = (os.getenv("TESSERACT_CMD") or "").strip()
+    if not cmd:
+        cmd = shutil.which("tesseract") or ""
+    if not cmd:
+        for p in (
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        ):
+            if os.path.exists(p):
+                cmd = p
+                break
+
     if cmd and os.path.exists(cmd):
         try:
             pytesseract.pytesseract.tesseract_cmd = cmd
@@ -567,9 +594,8 @@ def validate_and_convert_image_upload(
     filename: str,
     content_type: str | None,
     max_bytes: int = 5 * 1024 * 1024,
-    min_width: int = 300,
-    min_height: int = 300,
-) -> tuple[bytes, int, int, str]:
+    max_dim: int = 2000,
+) -> tuple[bytes, int, int, str, str]:
     if not file_bytes:
         raise ValueError("File kosong")
 
@@ -581,19 +607,17 @@ def validate_and_convert_image_upload(
     ct = (content_type or "").strip().lower() or None
 
     if ext and ext not in _ALLOWED_IMAGE_EXTS:
-        raise ValueError("Format tidak didukung. Gunakan JPG/JPEG/PNG/GIF/TIFF")
+        raise ValueError("Format tidak didukung. Gunakan JPG/JPEG/PNG/WEBP")
 
     if ct and ct not in _ALLOWED_IMAGE_MIMES:
-        raise ValueError("MIME type tidak didukung. Gunakan image/jpeg, image/png, image/gif, atau image/tiff")
+        raise ValueError("MIME type tidak didukung. Gunakan image/jpeg, image/png, atau image/webp")
 
     if ext and ct:
         mime_by_ext = {
             ".png": "image/png",
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
-            ".gif": "image/gif",
-            ".tif": "image/tiff",
-            ".tiff": "image/tiff",
+            ".webp": "image/webp",
         }
         expected = mime_by_ext.get(ext)
         if expected and ct != expected:
@@ -605,9 +629,20 @@ def validate_and_convert_image_upload(
     except Exception as e:
         raise ValueError(f"Gagal membaca gambar: {e}")
 
-    fmt = (img.format or "").upper()
-    if fmt not in {"PNG", "JPEG", "GIF", "TIFF"}:
-        raise ValueError("Format gambar tidak didukung. Gunakan JPG/JPEG/PNG/GIF/TIFF")
+    fmt_in = (img.format or "").upper()
+
+    try:
+        transposed = ImageOps.exif_transpose(img)
+        if transposed is not None:
+            img = transposed
+    except Exception:
+        pass
+
+    fmt = fmt_in or (img.format or "").upper()
+    if fmt == "JPG":
+        fmt = "JPEG"
+    if fmt not in {"PNG", "JPEG", "WEBP"}:
+        raise ValueError("Format gambar tidak didukung. Gunakan JPG/JPEG/PNG/WEBP")
 
     try:
         if getattr(img, "n_frames", 1) > 1:
@@ -616,23 +651,64 @@ def validate_and_convert_image_upload(
         pass
 
     w, h = img.size
-    if w < min_width or h < min_height:
-        raise ValueError(f"Resolusi minimal {min_width}x{min_height} piksel")
+    out_w, out_h = int(w), int(h)
+    if max_dim and (out_w > max_dim or out_h > max_dim):
+        scale = min(max_dim / max(1, out_w), max_dim / max(1, out_h))
+        new_w = max(1, int(round(out_w * scale)))
+        new_h = max(1, int(round(out_h * scale)))
+        try:
+            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        except Exception:
+            img = img.resize((new_w, new_h))
+        out_w, out_h = new_w, new_h
 
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGBA" if "A" in img.mode else "RGB")
 
     buf = io.BytesIO()
+    out_mime = "image/png"
+    out_ext = ".png"
     try:
-        img.save(buf, format="PNG", optimize=True, compress_level=9)
+        if fmt == "PNG" or img.mode == "RGBA":
+            img.save(buf, format="PNG", optimize=True, compress_level=9)
+            out_mime = "image/png"
+            out_ext = ".png"
+        else:
+            img_rgb = img.convert("RGB")
+            img_rgb.save(buf, format="JPEG", quality=88, optimize=True, progressive=True)
+            out_mime = "image/jpeg"
+            out_ext = ".jpg"
     except Exception as e:
         raise ValueError(f"Konversi gambar gagal: {e}")
 
     out = buf.getvalue()
     if len(out) > max_bytes:
-        raise ValueError("Ukuran file melebihi 5MB setelah konversi")
+        if out_mime == "image/jpeg":
+            for q in (80, 72, 65):
+                buf = io.BytesIO()
+                try:
+                    img.convert("RGB").save(buf, format="JPEG", quality=q, optimize=True, progressive=True)
+                except Exception:
+                    continue
+                out = buf.getvalue()
+                if len(out) <= max_bytes:
+                    break
+        else:
+            try:
+                bg = Image.new("RGB", img.size, color=(255, 255, 255))
+                bg.paste(img.convert("RGBA"), mask=img.convert("RGBA").split()[-1])
+                buf = io.BytesIO()
+                bg.save(buf, format="JPEG", quality=85, optimize=True, progressive=True)
+                out = buf.getvalue()
+                out_mime = "image/jpeg"
+                out_ext = ".jpg"
+            except Exception:
+                pass
 
-    return out, int(w), int(h), "image/png"
+        if len(out) > max_bytes:
+            raise ValueError("Ukuran file melebihi 5MB setelah konversi")
+
+    return out, int(out_w), int(out_h), out_mime, out_ext
 
 
 def convert_image_bytes_to_pdf(image_bytes: bytes) -> bytes:
@@ -754,6 +830,9 @@ def ocr_pdf_text(file_bytes: bytes, max_pages: int = 15) -> tuple[str, str | Non
     if pytesseract is None:
         return "", "pytesseract tidak tersedia"
 
+    if fitz is None:
+        return "", "PyMuPDF (fitz) tidak tersedia"
+
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     out: list[str] = []
     pages = min(len(doc), max_pages)
@@ -801,6 +880,7 @@ def _ensure_tesseract_ready(pytesseract) -> None:
 
 
 def _render_pdf_page_to_image(pdf_bytes: bytes, page_index: int, dpi: int) -> Image.Image:
+    _require_fitz()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     if page_index < 0 or page_index >= len(doc):
         raise ValueError(f"page_index di luar range: {page_index} (pages={len(doc)})")
@@ -818,7 +898,10 @@ def _preprocess_for_ocr(img: Image.Image, *, threshold: int = 185, upscale: floa
     if upscale and upscale != 1.0:
         w, h = g.size
         g = g.resize((max(1, int(w * upscale)), max(1, int(h * upscale))), resample=Image.Resampling.LANCZOS)
-    bw = g.point(lambda p: 255 if p >= threshold else 0)
+    thr = int(threshold)
+    def _thr_fn(v: int) -> int:
+        return 255 if v >= thr else 0
+    bw = g.point(_thr_fn)
     return bw
 
 
@@ -838,7 +921,9 @@ def _maybe_rotate_with_osd(pytesseract, img: Image.Image) -> Image.Image:
 
 
 def _image_to_tokens(pytesseract, img: Image.Image, *, psm: int = 6, lang: str = "eng") -> list[_OCRToken]:
-    from pytesseract import Output
+    Output = getattr(pytesseract, "Output", None)
+    if Output is None:
+        raise RuntimeError("pytesseract Output tidak tersedia")
 
     data = pytesseract.image_to_data(
         img,
